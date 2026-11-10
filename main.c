@@ -273,14 +273,17 @@ static void encode_array(const char **items, const int *lens, int count) {
 }
 
 /* ============================================================
- * Hash (inner) — open addressing with tombstones
+ * Hash (inner) — open addressing with tombstones + insertion seq
  * ============================================================ */
+static uint64_t hash_seq_counter = 0;
+
 typedef struct HashField {
   char *field;
   int flen;
   char *value;
   int vlen;
-  int used; /* 0 empty | 1 occupied | 2 tombstone */
+  int used;
+  uint64_t seq;
 } HashField;
 
 typedef struct {
@@ -342,7 +345,7 @@ static HashField *hash_get(Hash *h, const char *field, int flen) {
   return (h->entries[i].used == 1) ? &h->entries[i] : NULL;
 }
 
-/* Returns 1 if field was newly created, 0 if it overwrote an existing one. */
+/* Returns 1 if newly created, 0 if overwritten. */
 static int hash_set(Hash *h, const char *field, int flen, const char *value,
                     int vlen) {
   if ((h->count + 1) * 10 >= h->cap * 7)
@@ -362,12 +365,40 @@ static int hash_set(Hash *h, const char *field, int flen, const char *value,
   h->entries[i].value = malloc((size_t)vlen);
   memcpy(h->entries[i].value, value, (size_t)vlen);
   h->entries[i].vlen = vlen;
+  h->entries[i].seq = ++hash_seq_counter;
   h->count++;
   return 1;
 }
 
+/* Returns 1 if field existed and was removed, 0 otherwise. */
+static int hash_del(Hash *h, const char *field, int flen) {
+  size_t i = hash_find_slot(h, field, flen);
+  if (h->entries[i].used != 1)
+    return 0;
+  free(h->entries[i].field);
+  free(h->entries[i].value);
+  h->entries[i].field = NULL;
+  h->entries[i].value = NULL;
+  h->entries[i].flen = h->entries[i].vlen = 0;
+  h->entries[i].seq = 0;
+  h->entries[i].used = 2;
+  h->count--;
+  return 1;
+}
+
+/* qsort comparator: insertion order (ascending seq). */
+static int cmp_seq(const void *a, const void *b) {
+  const HashField *fa = *(const HashField *const *)a;
+  const HashField *fb = *(const HashField *const *)b;
+  if (fa->seq < fb->seq)
+    return -1;
+  if (fa->seq > fb->seq)
+    return 1;
+  return 0;
+}
+
 /* ============================================================
- * Top-level store: slots hold strings, lists, or hashes
+ * Top-level store
  * ============================================================ */
 typedef enum { T_STR = 1, T_LIST = 2, T_HASH = 3 } ValueType;
 
@@ -389,9 +420,9 @@ typedef struct {
   long long expire_at_ms;
   ValueType type;
   char *val;
-  int vlen;  /* T_STR */
-  List list; /* T_LIST */
-  Hash hash; /* T_HASH */
+  int vlen;
+  List list;
+  Hash hash;
 } Slot;
 
 typedef struct {
@@ -719,12 +750,13 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1},   {"ECHO", 1, 1},    {"SET", 2, 6},    {"GET", 1, 1},
-    {"EXISTS", 1, 1}, {"DBSIZE", 0, 0},  {"INCR", 1, 1},   {"DECR", 1, 1},
-    {"INCRBY", 2, 2}, {"DECRBY", 2, 2},  {"EXPIRE", 2, 2}, {"TTL", 1, 1},
-    {"PTTL", 1, 1},   {"PERSIST", 1, 1}, {"WAIT", 1, 1},   {"LPUSH", 2, -1},
-    {"RPUSH", 2, -1}, {"LRANGE", 3, 3},  {"LPOP", 1, 1},   {"RPOP", 1, 1},
-    {"LLEN", 1, 1},   {"HSET", 3, -1},   {"HGET", 2, 2},
+    {"PING", 0, 1},    {"ECHO", 1, 1},    {"SET", 2, 6},    {"GET", 1, 1},
+    {"EXISTS", 1, 1},  {"DBSIZE", 0, 0},  {"INCR", 1, 1},   {"DECR", 1, 1},
+    {"INCRBY", 2, 2},  {"DECRBY", 2, 2},  {"EXPIRE", 2, 2}, {"TTL", 1, 1},
+    {"PTTL", 1, 1},    {"PERSIST", 1, 1}, {"WAIT", 1, 1},   {"LPUSH", 2, -1},
+    {"RPUSH", 2, -1},  {"LRANGE", 3, 3},  {"LPOP", 1, 1},   {"RPOP", 1, 1},
+    {"LLEN", 1, 1},    {"HSET", 3, -1},   {"HGET", 2, 2},   {"HDEL", 2, -1},
+    {"HGETALL", 1, 1}, {"HEXISTS", 2, 2}, {"HLEN", 1, 1},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -1018,7 +1050,6 @@ static void handle_command(Bulk args[], int argc) {
     else
       resp_integer(s->list.len);
   } else if (strcmp(cmd, "HSET") == 0) {
-    /* args: key f1 v1 [f2 v2 ...] — argc-2 must be even and >= 2 */
     int nargs = argc - 2;
     if (nargs % 2 != 0) {
       resp_error("ERR wrong number of arguments for 'hset' command");
@@ -1033,10 +1064,9 @@ static void handle_command(Bulk args[], int argc) {
           s = hm_get(&DB, args[1].data, args[1].len);
         }
         int new_count = 0;
-        for (int i = 2; i + 1 < argc; i += 2) {
+        for (int i = 2; i + 1 < argc; i += 2)
           new_count += hash_set(&s->hash, args[i].data, args[i].len,
                                 args[i + 1].data, args[i + 1].len);
-        }
         resp_integer(new_count);
       }
     }
@@ -1054,6 +1084,69 @@ static void handle_command(Bulk args[], int argc) {
       else
         resp_bulk(f->value, f->vlen);
     }
+  } else if (strcmp(cmd, "HDEL") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s)
+      resp_integer(0);
+    else if (s->type != T_HASH)
+      resp_error(WRONGTYPE_MSG);
+    else {
+      int removed = 0;
+      for (int i = 2; i < argc; i++)
+        removed += hash_del(&s->hash, args[i].data, args[i].len);
+      if (s->hash.count == 0) {
+        slot_clear(s);
+        DB.count--;
+      }
+      resp_integer(removed);
+    }
+  } else if (strcmp(cmd, "HGETALL") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s) {
+      resp_array_header(0);
+    } else if (s->type != T_HASH)
+      resp_error(WRONGTYPE_MSG);
+    else {
+      int live = (int)s->hash.count;
+      if (live == 0) {
+        resp_array_header(0);
+      } else {
+        /* collect live fields, sort by insertion seq, flatten */
+        HashField **fields = malloc(sizeof(HashField *) * (size_t)live);
+        int k = 0;
+        for (size_t i = 0; i < s->hash.cap; i++)
+          if (s->hash.entries[i].used == 1)
+            fields[k++] = &s->hash.entries[i];
+        qsort(fields, (size_t)live, sizeof(HashField *), cmp_seq);
+
+        resp_array_header(live * 2);
+        for (int i = 0; i < live; i++) {
+          resp_bulk(fields[i]->field, fields[i]->flen);
+          resp_bulk(fields[i]->value, fields[i]->vlen);
+        }
+        free(fields);
+      }
+    }
+  } else if (strcmp(cmd, "HEXISTS") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s)
+      resp_integer(0);
+    else if (s->type != T_HASH)
+      resp_error(WRONGTYPE_MSG);
+    else
+      resp_integer(hash_get(&s->hash, args[2].data, args[2].len) ? 1 : 0);
+  } else if (strcmp(cmd, "HLEN") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s)
+      resp_integer(0);
+    else if (s->type != T_HASH)
+      resp_error(WRONGTYPE_MSG);
+    else
+      resp_integer((long long)s->hash.count);
   }
   fflush(stdout);
 }
