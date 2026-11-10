@@ -266,6 +266,13 @@ static void resp_bulk(const char *data, int len) {
 static void resp_null_bulk(void) { printf("$-1\r\n"); }
 static void resp_array_header(int n) { printf("*%d\r\n", n); }
 
+/* Shared array encoder — used by LRANGE (and later HGETALL, SMEMBERS, ...) */
+static void encode_array(const char **items, const int *lens, int count) {
+  resp_array_header(count);
+  for (int i = 0; i < count; i++)
+    resp_bulk(items[i], lens[i]);
+}
+
 /* ============================================================
  * Hash map with tri-state slots + typed values
  * ============================================================ */
@@ -497,8 +504,6 @@ static void list_push_tail(List *l, const char *data, int len) {
   l->len++;
 }
 
-/* Pop head/tail. Returns 1 and sets out_data (caller frees) / out_len.
- * Returns 0 if list is empty. Does NOT free the list itself. */
 static int list_pop_head(List *l, char **out_data, int *out_len) {
   if (!l->head)
     return 0;
@@ -827,12 +832,13 @@ static void handle_command(Bulk args[], int argc) {
     } else {
       expire_if_needed_impl(args[1].data, args[1].len);
       Slot *s = hm_get(&DB, args[1].data, args[1].len);
-      if (!s) {
-        resp_array_header(0);
-      } else if (s->type != T_LIST)
+
+      if (s && s->type != T_LIST) {
         resp_error(WRONGTYPE_MSG);
-      else {
-        long n = s->list.len;
+      } else {
+        long n = s ? s->list.len : 0;
+
+        /* normalize negatives, then clamp (normalize BEFORE clamp) */
         if (start < 0)
           start += n;
         if (stop < 0)
@@ -841,17 +847,25 @@ static void handle_command(Bulk args[], int argc) {
           start = 0;
         if (stop >= n)
           stop = n - 1;
-        if (start > stop || start >= n)
-          resp_array_header(0);
-        else {
-          resp_array_header((int)(stop - start + 1));
+
+        if (n == 0 || start > stop) {
+          resp_array_header(0); /* single empty-array path */
+        } else {
+          int count = (int)(stop - start + 1);
+          const char **items = malloc(sizeof(char *) * (size_t)count);
+          int *lens = malloc(sizeof(int) * (size_t)count);
+
           ListNode *cur = s->list.head;
           for (long i = 0; i < start && cur; i++)
             cur = cur->next;
-          for (long i = start; i <= stop && cur; i++) {
-            resp_bulk(cur->data, cur->len);
+          for (int i = 0; i < count && cur; i++) {
+            items[i] = cur->data;
+            lens[i] = cur->len;
             cur = cur->next;
           }
+          encode_array(items, lens, count);
+          free(items);
+          free(lens);
         }
       }
     }
@@ -870,11 +884,9 @@ static void handle_command(Bulk args[], int argc) {
                        : list_pop_tail(&s->list, &pdata, &plen);
       if (!ok) {
         resp_null_bulk();
-      } /* shouldn't happen: empty lists tombstone */
-      else {
+      } else {
         resp_bulk(pdata, plen);
         free(pdata);
-        /* auto-delete when list is now empty */
         if (s->list.len == 0) {
           slot_clear(s);
           DB.count--;
