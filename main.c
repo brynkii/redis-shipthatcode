@@ -265,7 +265,6 @@ static void resp_bulk(const char *data, int len) {
 }
 static void resp_null_bulk(void) { printf("$-1\r\n"); }
 static void resp_array_header(int n) { printf("*%d\r\n", n); }
-static void resp_null_array(void) { printf("*-1\r\n"); }
 
 /* ============================================================
  * Hash map with tri-state slots + typed values
@@ -286,12 +285,12 @@ typedef struct {
 typedef struct {
   char *key;
   int klen;
-  int used; /* 0 empty | 1 occupied | 2 tombstone */
+  int used;
   long long expire_at_ms;
   ValueType type;
   char *val;
-  int vlen;  /* T_STR */
-  List list; /* T_LIST */
+  int vlen;
+  List list;
 } Slot;
 
 typedef struct {
@@ -325,16 +324,16 @@ static void slot_clear(Slot *s) {
   free(s->key);
   s->key = NULL;
   s->klen = 0;
-  if (s->type == T_LIST) {
+  if (s->type == T_LIST)
     list_free(&s->list);
-  } else {
+  else {
     free(s->val);
     s->val = NULL;
     s->vlen = 0;
   }
   s->expire_at_ms = 0;
   s->type = T_STR;
-  s->used = 2; /* tombstone */
+  s->used = 2;
 }
 
 static void hm_init(HashMap *m, size_t cap) {
@@ -390,7 +389,6 @@ static Slot *hm_get(HashMap *m, const char *key, int klen) {
   return (m->slots[i].used == 1) ? &m->slots[i] : NULL;
 }
 
-/* Insert or overwrite a string value. */
 static void hm_set_str(HashMap *m, const char *key, int klen, const char *val,
                        int vlen, long long expire_at_ms) {
   if ((m->count + 1) * 10 >= m->cap * 7)
@@ -422,14 +420,12 @@ static void hm_set_str(HashMap *m, const char *key, int klen, const char *val,
   m->count++;
 }
 
-/* Insert a fresh list (used by LPUSH/RPUSH when key doesn't exist). */
 static void hm_set_list(HashMap *m, const char *key, int klen,
                         long long expire_at_ms) {
   if ((m->count + 1) * 10 >= m->cap * 7)
     hm_grow(m);
   size_t i = hm_find_slot(m, key, klen);
   if (m->slots[i].used == 1) {
-    /* caller already verified type is LIST */
     m->slots[i].expire_at_ms = expire_at_ms;
     return;
   }
@@ -448,7 +444,6 @@ static void hm_set_list(HashMap *m, const char *key, int klen,
 
 static HashMap DB;
 
-/* Reap expired slot; returns 1 if removed. */
 static int expire_if_needed_impl(const char *key, int klen) {
   Slot *s = hm_get(&DB, key, klen);
   if (!s)
@@ -500,6 +495,39 @@ static void list_push_tail(List *l, const char *data, int len) {
     l->head = n;
   l->tail = n;
   l->len++;
+}
+
+/* Pop head/tail. Returns 1 and sets out_data (caller frees) / out_len.
+ * Returns 0 if list is empty. Does NOT free the list itself. */
+static int list_pop_head(List *l, char **out_data, int *out_len) {
+  if (!l->head)
+    return 0;
+  ListNode *n = l->head;
+  l->head = n->next;
+  if (l->head)
+    l->head->prev = NULL;
+  else
+    l->tail = NULL;
+  l->len--;
+  *out_data = n->data;
+  *out_len = n->len;
+  free(n);
+  return 1;
+}
+static int list_pop_tail(List *l, char **out_data, int *out_len) {
+  if (!l->tail)
+    return 0;
+  ListNode *n = l->tail;
+  l->tail = n->prev;
+  if (l->tail)
+    l->tail->next = NULL;
+  else
+    l->head = NULL;
+  l->len--;
+  *out_data = n->data;
+  *out_len = n->len;
+  free(n);
+  return 1;
 }
 
 /* ============================================================
@@ -566,13 +594,12 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1},   {"ECHO", 1, 1},    {"SET", 2, 6},
-    {"GET", 1, 1},    {"EXISTS", 1, 1},  {"DBSIZE", 0, 0},
-    {"INCR", 1, 1},   {"DECR", 1, 1},    {"INCRBY", 2, 2},
-    {"DECRBY", 2, 2}, {"EXPIRE", 2, 2},  {"TTL", 1, 1},
-    {"PTTL", 1, 1},   {"PERSIST", 1, 1}, {"WAIT", 1, 1},
-    {"LPUSH", 2, -1},                   /* key value [value ...] */
-    {"RPUSH", 2, -1}, {"LRANGE", 3, 3}, /* key start stop */
+    {"PING", 0, 1},   {"ECHO", 1, 1},    {"SET", 2, 6},    {"GET", 1, 1},
+    {"EXISTS", 1, 1}, {"DBSIZE", 0, 0},  {"INCR", 1, 1},   {"DECR", 1, 1},
+    {"INCRBY", 2, 2}, {"DECRBY", 2, 2},  {"EXPIRE", 2, 2}, {"TTL", 1, 1},
+    {"PTTL", 1, 1},   {"PERSIST", 1, 1}, {"WAIT", 1, 1},   {"LPUSH", 2, -1},
+    {"RPUSH", 2, -1}, {"LRANGE", 3, 3},  {"LPOP", 1, 1},   {"RPOP", 1, 1},
+    {"LLEN", 1, 1},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -814,9 +841,9 @@ static void handle_command(Bulk args[], int argc) {
           start = 0;
         if (stop >= n)
           stop = n - 1;
-        if (start > stop || start >= n) {
+        if (start > stop || start >= n)
           resp_array_header(0);
-        } else {
+        else {
           resp_array_header((int)(stop - start + 1));
           ListNode *cur = s->list.head;
           for (long i = 0; i < start && cur; i++)
@@ -828,6 +855,41 @@ static void handle_command(Bulk args[], int argc) {
         }
       }
     }
+  } else if (strcmp(cmd, "LPOP") == 0 || strcmp(cmd, "RPOP") == 0) {
+    int is_lpop = (cmd[0] == 'L');
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s) {
+      resp_null_bulk();
+    } else if (s->type != T_LIST)
+      resp_error(WRONGTYPE_MSG);
+    else {
+      char *pdata = NULL;
+      int plen = 0;
+      int ok = is_lpop ? list_pop_head(&s->list, &pdata, &plen)
+                       : list_pop_tail(&s->list, &pdata, &plen);
+      if (!ok) {
+        resp_null_bulk();
+      } /* shouldn't happen: empty lists tombstone */
+      else {
+        resp_bulk(pdata, plen);
+        free(pdata);
+        /* auto-delete when list is now empty */
+        if (s->list.len == 0) {
+          slot_clear(s);
+          DB.count--;
+        }
+      }
+    }
+  } else if (strcmp(cmd, "LLEN") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s)
+      resp_integer(0);
+    else if (s->type != T_LIST)
+      resp_error(WRONGTYPE_MSG);
+    else
+      resp_integer(s->list.len);
   }
   fflush(stdout);
 }
