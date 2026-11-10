@@ -1,9 +1,11 @@
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define MAX_ARGS 64
+#define MAX_LINE 4096
 
 typedef struct {
   char *data;
@@ -11,18 +13,20 @@ typedef struct {
 } Bulk;
 
 /* ============================================================
- * Buffered binary-safe reader over stdin
+ * Buffered reader over stdin (binary safe)
  * ============================================================ */
 
 typedef struct {
   unsigned char *buf;
   size_t cap, len, pos;
+  int peeked; /* -1 = no peek, else the peeked byte */
 } Reader;
 
 static void reader_init(Reader *r) {
   r->cap = 8192;
   r->len = 0;
   r->pos = 0;
+  r->peeked = -1;
   r->buf = (unsigned char *)malloc(r->cap);
 }
 static void reader_free(Reader *r) {
@@ -38,9 +42,22 @@ static int reader_fill(Reader *r) {
   return r->len > 0;
 }
 static int reader_getc(Reader *r) {
+  if (r->peeked >= 0) {
+    int c = r->peeked;
+    r->peeked = -1;
+    return c;
+  }
   if (r->pos >= r->len && !reader_fill(r))
     return -1;
   return r->buf[r->pos++];
+}
+static int reader_peekc(Reader *r) {
+  if (r->peeked >= 0)
+    return r->peeked;
+  if (r->pos >= r->len && !reader_fill(r))
+    return -1;
+  r->peeked = r->buf[r->pos++]; /* consume so next getc returns it */
+  return r->peeked;
 }
 static int reader_read(Reader *r, unsigned char *out, size_t n) {
   size_t got = 0;
@@ -56,7 +73,7 @@ static int reader_read(Reader *r, unsigned char *out, size_t n) {
   return 1;
 }
 
-/* Read a header line terminated by CRLF or bare LF; strip terminator. */
+/* Read a line terminated by CRLF or LF; strip terminator; NUL-terminate. */
 static char *reader_readline(Reader *r) {
   size_t cap = 64, len = 0;
   char *out = (char *)malloc(cap);
@@ -68,7 +85,7 @@ static char *reader_readline(Reader *r) {
     }
     if (c == '\n') {
       if (len > 0 && out[len - 1] == '\r')
-        len--; /* strip optional CR */
+        len--;
       break;
     }
     if (len + 1 >= cap) {
@@ -81,7 +98,6 @@ static char *reader_readline(Reader *r) {
   return out;
 }
 
-/* Consume the terminator after bulk data: CRLF or LF. Returns 1 on OK. */
 static int reader_consume_terminator(Reader *r) {
   int c = reader_getc(r);
   if (c == '\n')
@@ -94,7 +110,7 @@ static int reader_consume_terminator(Reader *r) {
 }
 
 /* ============================================================
- * RESP request parser
+ * RESP array request parser (step 05 format)
  * ============================================================ */
 
 static void free_args(Bulk args[], int argc) {
@@ -102,10 +118,11 @@ static void free_args(Bulk args[], int argc) {
     free(args[i].data);
 }
 
-static int parse_request(Reader *r, Bulk args[], int max_args, char **errmsg) {
+static int parse_resp_request(Reader *r, Bulk args[], int max_args,
+                              char **errmsg) {
   int c = reader_getc(r);
   if (c < 0)
-    return 0; /* clean EOF */
+    return 0;
   if (c != '*') {
     *errmsg = strdup("ERR Protocol error: expected '*'");
     return -1;
@@ -119,14 +136,14 @@ static int parse_request(Reader *r, Bulk args[], int max_args, char **errmsg) {
 
   char *endp = NULL;
   long n = strtol(line, &endp, 10);
-  int bad = (!endp || *endp != '\0' || n < 0); /* check BEFORE freeing */
+  int bad = (!endp || *endp != '\0' || n < 0);
   free(line);
   if (bad) {
     *errmsg = strdup("ERR Protocol error: invalid multibulk length");
     return -1;
   }
   if (n == 0)
-    return 0; /* empty array: no-op */
+    return 0;
   if (n > max_args) {
     *errmsg = strdup("ERR Protocol error: too many arguments");
     return -1;
@@ -148,7 +165,7 @@ static int parse_request(Reader *r, Bulk args[], int max_args, char **errmsg) {
     }
     char *e2 = NULL;
     long blen = strtol(lenline, &e2, 10);
-    int bad_len = (!e2 || *e2 != '\0' || blen < 0); /* check BEFORE freeing */
+    int bad_len = (!e2 || *e2 != '\0' || blen < 0);
     free(lenline);
     if (bad_len) {
       *errmsg = strdup("ERR Protocol error: invalid bulk length");
@@ -163,14 +180,12 @@ static int parse_request(Reader *r, Bulk args[], int max_args, char **errmsg) {
       return -1;
     }
     data[blen] = '\0';
-
     if (!reader_consume_terminator(r)) {
       free(data);
       *errmsg = strdup("ERR Protocol error: expected CRLF after bulk");
       free_args(args, argc);
       return -1;
     }
-
     args[argc].data = data;
     args[argc].len = (int)blen;
     argc++;
@@ -179,12 +194,82 @@ static int parse_request(Reader *r, Bulk args[], int max_args, char **errmsg) {
 }
 
 /* ============================================================
+ * Text line parser (step 01–04 format)
+ * Splits on spaces with "..." quoting, strips CRLF.
+ * ============================================================ */
+
+static int parse_text_request(char *line, Bulk args[], int max_args) {
+  int count = 0;
+  int in_quotes = 0;
+  char *start = NULL;
+
+  for (char *p = line; *p && count < max_args; p++) {
+    if (*p == '"' && !in_quotes) {
+      in_quotes = 1;
+      start = p + 1;
+    } else if (*p == '"' && in_quotes) {
+      in_quotes = 0;
+      *p = '\0';
+      args[count].data = start;
+      args[count].len = (int)strlen(start);
+      count++;
+      start = NULL;
+    } else if (*p == ' ' && !in_quotes) {
+      if (start) {
+        *p = '\0';
+        args[count].data = start;
+        args[count].len = (int)strlen(start);
+        count++;
+        start = NULL;
+      }
+    } else if (!start) {
+      start = p;
+    }
+  }
+  if (start && count < max_args) {
+    args[count].data = start;
+    args[count].len = (int)strlen(start);
+    count++;
+  }
+  return count;
+}
+
+/* Read one full text line into a malloc'd, NUL-terminated buffer. */
+static char *reader_read_rawline(Reader *r) {
+  size_t cap = 128, len = 0;
+  char *out = (char *)malloc(cap);
+  for (;;) {
+    int c = reader_getc(r);
+    if (c < 0) {
+      if (len == 0) {
+        free(out);
+        return NULL;
+      }
+      break;
+    }
+    if (c == '\n')
+      break;
+    if (len + 1 >= cap) {
+      cap *= 2;
+      out = (char *)realloc(out, cap);
+    }
+    out[len++] = (char)c;
+  }
+  if (len > 0 && out[len - 1] == '\r')
+    len--;
+  out[len] = '\0';
+  return out;
+}
+
+/* ============================================================
  * RESP response serialization
  * ============================================================ */
 
 static void resp_simple_string(const char *s) { printf("+%s\r\n", s); }
 static void resp_error(const char *msg) { printf("-%s\r\n", msg); }
-static void resp_integer(long long n) { printf(":%lld\r\n", n); }
+static void __attribute__((unused)) resp_integer(long long n) {
+  printf(":%lld\r\n", n);
+}
 static void resp_bulk(const char *data, int len) {
   printf("$%d\r\n", len);
   if (len > 0)
@@ -194,43 +279,102 @@ static void resp_bulk(const char *data, int len) {
 static void resp_null_bulk(void) { printf("$-1\r\n"); }
 
 /* ============================================================
- * In-memory store (binary-safe)
+ * In-memory hash map (binary-safe)
  * ============================================================ */
 
-typedef struct Entry {
+typedef struct {
   char *key;
   int klen;
   char *val;
   int vlen;
-  struct Entry *next;
-} Entry;
-static Entry *store = NULL;
+  int used;
+} Slot;
+typedef struct {
+  Slot *slots;
+  size_t cap, count;
+} HashMap;
 
-static Entry *store_find(const char *key, int klen) {
-  for (Entry *e = store; e; e = e->next)
-    if (e->klen == klen && memcmp(e->key, key, (size_t)klen) == 0)
-      return e;
-  return NULL;
+static uint64_t fnv1a(const void *data, size_t len) {
+  const unsigned char *p = (const unsigned char *)data;
+  uint64_t h = 1469598103934665603ULL;
+  for (size_t i = 0; i < len; i++) {
+    h ^= p[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
 }
-static void store_set(const char *key, int klen, const char *val, int vlen) {
-  Entry *e = store_find(key, klen);
-  if (e) {
-    free(e->val);
-    e->val = (char *)malloc((size_t)vlen);
-    memcpy(e->val, val, (size_t)vlen);
-    e->vlen = vlen;
+
+static void hm_init(HashMap *m, size_t cap) {
+  size_t c = 8;
+  while (c < cap)
+    c <<= 1;
+  m->cap = c;
+  m->count = 0;
+  m->slots = (Slot *)calloc(c, sizeof(Slot));
+}
+static void hm_free(HashMap *m) {
+  for (size_t i = 0; i < m->cap; i++)
+    if (m->slots[i].used) {
+      free(m->slots[i].key);
+      free(m->slots[i].val);
+    }
+  free(m->slots);
+  m->slots = NULL;
+  m->cap = m->count = 0;
+}
+static size_t hm_find_slot(const HashMap *m, const char *key, int klen) {
+  uint64_t h = fnv1a(key, (size_t)klen);
+  size_t mask = m->cap - 1, i = (size_t)h & mask;
+  while (m->slots[i].used) {
+    if (m->slots[i].klen == klen &&
+        memcmp(m->slots[i].key, key, (size_t)klen) == 0)
+      return i;
+    i = (i + 1) & mask;
+  }
+  return i;
+}
+static void hm_grow(HashMap *m) {
+  size_t newcap = m->cap * 2;
+  Slot *old = m->slots;
+  size_t oldcap = m->cap;
+  m->slots = (Slot *)calloc(newcap, sizeof(Slot));
+  m->cap = newcap;
+  m->count = 0;
+  for (size_t i = 0; i < oldcap; i++)
+    if (old[i].used) {
+      size_t j = hm_find_slot(m, old[i].key, old[i].klen);
+      m->slots[j] = old[i];
+      m->count++;
+    }
+  free(old);
+}
+static Slot *hm_get(HashMap *m, const char *key, int klen) {
+  size_t i = hm_find_slot(m, key, klen);
+  return m->slots[i].used ? &m->slots[i] : NULL;
+}
+static void hm_set(HashMap *m, const char *key, int klen, const char *val,
+                   int vlen) {
+  if ((m->count + 1) * 10 >= m->cap * 7)
+    hm_grow(m);
+  size_t i = hm_find_slot(m, key, klen);
+  if (m->slots[i].used) {
+    free(m->slots[i].val);
+    m->slots[i].val = (char *)malloc((size_t)vlen);
+    memcpy(m->slots[i].val, val, (size_t)vlen);
+    m->slots[i].vlen = vlen;
     return;
   }
-  e = (Entry *)malloc(sizeof(Entry));
-  e->key = (char *)malloc((size_t)klen);
-  memcpy(e->key, key, (size_t)klen);
-  e->klen = klen;
-  e->val = (char *)malloc((size_t)vlen);
-  memcpy(e->val, val, (size_t)vlen);
-  e->vlen = vlen;
-  e->next = store;
-  store = e;
+  m->slots[i].used = 1;
+  m->slots[i].key = (char *)malloc((size_t)klen);
+  memcpy(m->slots[i].key, key, (size_t)klen);
+  m->slots[i].klen = klen;
+  m->slots[i].val = (char *)malloc((size_t)vlen);
+  memcpy(m->slots[i].val, val, (size_t)vlen);
+  m->slots[i].vlen = vlen;
+  m->count++;
 }
+
+static HashMap DB;
 
 /* ============================================================
  * Command table + arity
@@ -256,7 +400,6 @@ static const CommandSpec *lookup_command(const char *upper_cmd) {
       return &COMMANDS[i];
   return NULL;
 }
-
 static int check_arity(const CommandSpec *spec, int argc) {
   int n = argc - 1;
   if (n < spec->min_args || (spec->max_args >= 0 && n > spec->max_args)) {
@@ -270,7 +413,7 @@ static int check_arity(const CommandSpec *spec, int argc) {
 }
 
 /* ============================================================
- * Dispatcher (command name uppercased on a copy only)
+ * Dispatcher
  * ============================================================ */
 
 static void handle_command(Bulk args[], int argc) {
@@ -305,12 +448,12 @@ static void handle_command(Bulk args[], int argc) {
   } else if (strcmp(cmd, "ECHO") == 0) {
     resp_bulk(args[1].data, args[1].len);
   } else if (strcmp(cmd, "SET") == 0) {
-    store_set(args[1].data, args[1].len, args[2].data, args[2].len);
+    hm_set(&DB, args[1].data, args[1].len, args[2].data, args[2].len);
     resp_simple_string("OK");
   } else if (strcmp(cmd, "GET") == 0) {
-    Entry *e = store_find(args[1].data, args[1].len);
-    if (e)
-      resp_bulk(e->val, e->vlen);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (s)
+      resp_bulk(s->val, s->vlen);
     else
       resp_null_bulk();
   }
@@ -318,28 +461,49 @@ static void handle_command(Bulk args[], int argc) {
 }
 
 /* ============================================================
- * Main
+ * Main: auto-detect RESP array vs text line
  * ============================================================ */
 
 int main(void) {
+  hm_init(&DB, 1024);
+
   Reader r;
   reader_init(&r);
   Bulk args[MAX_ARGS];
+
   for (;;) {
-    char *errmsg = NULL;
-    int argc = parse_request(&r, args, MAX_ARGS, &errmsg);
-    if (argc == 0 && errmsg == NULL)
-      break;
-    if (argc < 0) {
-      resp_error(errmsg);
-      free(errmsg);
-      fflush(stdout);
-      break;
+    int first = reader_peekc(&r);
+    if (first < 0)
+      break; /* EOF */
+
+    if (first == '*') {
+      /* RESP array request */
+      char *errmsg = NULL;
+      int argc = parse_resp_request(&r, args, MAX_ARGS, &errmsg);
+      if (argc < 0) {
+        resp_error(errmsg);
+        free(errmsg);
+        fflush(stdout);
+        break;
+      }
+      if (argc > 0)
+        handle_command(args, argc);
+      free_args(args, argc);
+    } else {
+      /* Text line request */
+      char *line = reader_read_rawline(&r);
+      if (!line)
+        break;
+      if (line[0] != '\0') {
+        int argc = parse_text_request(line, args, MAX_ARGS);
+        if (argc > 0)
+          handle_command(args, argc);
+      }
+      free(line); /* args[i].data point into `line`; do not free_args */
     }
-    if (argc > 0)
-      handle_command(args, argc);
-    free_args(args, argc);
   }
+
   reader_free(&r);
+  hm_free(&DB);
   return 0;
 }
