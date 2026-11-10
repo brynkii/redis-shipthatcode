@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
 #include <limits.h>
 #include <stdint.h>
@@ -13,6 +14,8 @@ typedef struct {
   char *data;
   int len;
 } Bulk;
+
+static FILE *g_out = NULL;
 
 /* ============================================================
  * Virtual clock
@@ -252,19 +255,25 @@ static int parse_text_request(char *line, Bulk args[], int max_args) {
 }
 
 /* ============================================================
- * RESP serialization
+ * RESP serialization (writes to g_out)
  * ============================================================ */
-static void resp_simple_string(const char *s) { printf("+%s\r\n", s); }
-static void resp_error(const char *msg) { printf("-%s\r\n", msg); }
-static void resp_integer(long long n) { printf(":%lld\r\n", n); }
+static void resp_simple_string(const char *s) { fprintf(g_out, "+%s\r\n", s); }
+static void resp_error(const char *msg) { fprintf(g_out, "-%s\r\n", msg); }
+static void resp_integer(long long n) { fprintf(g_out, ":%lld\r\n", n); }
 static void resp_bulk(const char *data, int len) {
-  printf("$%d\r\n", len);
+  fprintf(g_out, "$%d\r\n", len);
   if (len > 0)
-    fwrite(data, 1, (size_t)len, stdout);
-  printf("\r\n");
+    fwrite(data, 1, (size_t)len, g_out);
+  fprintf(g_out, "\r\n");
 }
-static void resp_null_bulk(void) { printf("$-1\r\n"); }
-static void resp_array_header(int n) { printf("*%d\r\n", n); }
+static void resp_null_bulk(void) { fprintf(g_out, "$-1\r\n"); }
+static void resp_array_header(int n) { fprintf(g_out, "*%d\r\n", n); }
+
+static void encode_array(const char **items, const int *lens, int count) {
+  resp_array_header(count);
+  for (int i = 0; i < count; i++)
+    resp_bulk(items[i], lens[i]);
+}
 
 /* ============================================================
  * FNV-1a
@@ -311,7 +320,7 @@ static void format_score(double s, char *buf, int bufsize) {
 }
 
 /* ============================================================
- * Hash
+ * Hash / Set / ZSet — unchanged from step 20
  * ============================================================ */
 static uint64_t hash_seq_counter = 0;
 typedef struct HashField {
@@ -420,9 +429,6 @@ static int cmp_hash_seq(const void *a, const void *b) {
   return 0;
 }
 
-/* ============================================================
- * Set
- * ============================================================ */
 typedef struct SetMember {
   char *data;
   int len;
@@ -432,7 +438,6 @@ typedef struct {
   SetMember *entries;
   size_t cap, count;
 } Set;
-
 static void set_init(Set *s) {
   s->cap = 8;
   s->count = 0;
@@ -503,9 +508,6 @@ static int set_remove(Set *s, const char *data, int len) {
   return 1;
 }
 
-/* ============================================================
- * ZSet
- * ============================================================ */
 typedef struct ZSetEntry {
   char *member;
   int mlen;
@@ -516,7 +518,6 @@ typedef struct {
   ZSetEntry *entries;
   size_t cap, count;
 } ZSet;
-
 static void zset_init(ZSet *z) {
   z->cap = 8;
   z->count = 0;
@@ -619,7 +620,6 @@ typedef enum {
   T_SET = 4,
   T_ZSET = 5
 } ValueType;
-
 typedef struct ListNode {
   char *data;
   int len;
@@ -681,7 +681,6 @@ static void slot_clear(Slot *s) {
   s->type = T_STR;
   s->used = 2;
 }
-
 static void hm_init(HashMap *m, size_t cap) {
   size_t c = 8;
   while (c < cap)
@@ -730,22 +729,6 @@ static Slot *hm_get(HashMap *m, const char *key, int klen) {
   size_t i = hm_find_slot(m, key, klen);
   return (m->slots[i].used == 1) ? &m->slots[i] : NULL;
 }
-
-/* Direct slot install (after clearing any prior occupant). Used by RENAME and
- * by the SET-family helpers below. Caller supplies the payload already
- * populated. */
-static Slot *hm_install_slot(HashMap *m, const char *key, int klen) {
-  if ((m->count + 1) * 10 >= m->cap * 7)
-    hm_grow(m);
-  size_t i = hm_find_slot(m, key, klen);
-  m->slots[i].used = 1;
-  m->slots[i].key = malloc((size_t)klen);
-  memcpy(m->slots[i].key, key, (size_t)klen);
-  m->slots[i].klen = klen;
-  m->count++;
-  return &m->slots[i];
-}
-
 static void hm_set_str(HashMap *m, const char *key, int klen, const char *val,
                        int vlen, long long expire_at_ms) {
   if ((m->count + 1) * 10 >= m->cap * 7)
@@ -1021,11 +1004,10 @@ static void do_incr_by(Bulk args[], int key_idx, long long delta) {
 }
 
 /* ============================================================
- * RENAME (direct slot move)
+ * RENAME
  * ============================================================ */
 static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
   if (slen == dlen && memcmp(src, dst, (size_t)slen) == 0) {
-    /* same key: ok iff src exists */
     expire_if_needed_impl(src, slen);
     return hm_get(&DB, src, slen) != NULL;
   }
@@ -1039,10 +1021,7 @@ static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
     slot_clear(d);
     DB.count--;
   }
-
-  /* Take ownership of src's payload into a local struct */
   Slot moved = *s;
-  /* Tombstone src WITHOUT freeing the payload pointers we just took */
   s->key = NULL;
   s->val = NULL;
   s->klen = 0;
@@ -1059,14 +1038,12 @@ static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
   s->type = T_STR;
   s->used = 2;
   DB.count--;
-
-  /* Install into dst */
   if ((DB.count + 1) * 10 >= DB.cap * 7)
     hm_grow(&DB);
   size_t di = hm_find_slot(&DB, dst, dlen);
   DB.slots[di] = moved;
   DB.slots[di].used = 1;
-  free(DB.slots[di].key); /* drop src's key bytes */
+  free(DB.slots[di].key);
   DB.slots[di].key = malloc((size_t)dlen);
   memcpy(DB.slots[di].key, dst, (size_t)dlen);
   DB.slots[di].klen = dlen;
@@ -1084,17 +1061,21 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1},     {"ECHO", 1, 1},      {"SET", 2, 6},    {"GET", 1, 1},
-    {"DEL", 1, -1},     {"EXISTS", 1, -1},   {"KEYS", 1, 1},   {"TYPE", 1, 1},
-    {"RENAME", 2, 2},   {"DBSIZE", 0, 0},    {"INCR", 1, 1},   {"DECR", 1, 1},
-    {"INCRBY", 2, 2},   {"DECRBY", 2, 2},    {"EXPIRE", 2, 2}, {"TTL", 1, 1},
-    {"PTTL", 1, 1},     {"PERSIST", 1, 1},   {"WAIT", 1, 1},   {"LPUSH", 2, -1},
-    {"RPUSH", 2, -1},   {"LRANGE", 3, 3},    {"LPOP", 1, 1},   {"RPOP", 1, 1},
-    {"LLEN", 1, 1},     {"HSET", 3, -1},     {"HGET", 2, 2},   {"HDEL", 2, -1},
-    {"HGETALL", 1, 1},  {"HEXISTS", 2, 2},   {"HLEN", 1, 1},   {"SADD", 2, -1},
-    {"SMEMBERS", 1, 1}, {"SISMEMBER", 2, 2}, {"SCARD", 1, 1},  {"SREM", 2, -1},
-    {"ZADD", 3, -1},    {"ZSCORE", 2, 2},    {"ZRANGE", 3, 4}, {"ZRANK", 2, 2},
-    {"ZCARD", 1, 1},
+    {"PING", 0, 1},      {"ECHO", 1, 1},    {"SET", 2, 6},
+    {"GET", 1, 1},       {"DEL", 1, -1},    {"EXISTS", 1, -1},
+    {"KEYS", 1, 1},      {"TYPE", 1, 1},    {"RENAME", 2, 2},
+    {"DBSIZE", 0, 0},    {"INCR", 1, 1},    {"DECR", 1, 1},
+    {"INCRBY", 2, 2},    {"DECRBY", 2, 2},  {"EXPIRE", 2, 2},
+    {"TTL", 1, 1},       {"PTTL", 1, 1},    {"PERSIST", 1, 1},
+    {"WAIT", 1, 1},      {"LPUSH", 2, -1},  {"RPUSH", 2, -1},
+    {"LRANGE", 3, 3},    {"LPOP", 1, 1},    {"RPOP", 1, 1},
+    {"LLEN", 1, 1},      {"HSET", 3, -1},   {"HGET", 2, 2},
+    {"HDEL", 2, -1},     {"HGETALL", 1, 1}, {"HEXISTS", 2, 2},
+    {"HLEN", 1, 1},      {"SADD", 2, -1},   {"SMEMBERS", 1, 1},
+    {"SISMEMBER", 2, 2}, {"SCARD", 1, 1},   {"SREM", 2, -1},
+    {"ZADD", 3, -1},     {"ZSCORE", 2, 2},  {"ZRANGE", 3, 4},
+    {"ZRANK", 2, 2},     {"ZCARD", 1, 1},   {"MULTI", 0, 0},
+    {"EXEC", 0, 0},      {"DISCARD", 0, 0},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -1117,9 +1098,9 @@ static int check_arity(const CommandSpec *spec, int argc) {
 }
 
 /* ============================================================
- * Dispatcher
+ * EXECUTE — real per-command executor (no MULTI/EXEC/DISCARD)
  * ============================================================ */
-static void handle_command(Bulk args[], int argc) {
+static void execute_command(Bulk args[], int argc) {
   char cmd[256];
   int cmdlen = args[0].len;
   if (cmdlen > (int)sizeof(cmd) - 1)
@@ -1135,14 +1116,13 @@ static void handle_command(Bulk args[], int argc) {
     snprintf(err, sizeof(err), "ERR unknown command '%.*s'", args[0].len,
              args[0].data);
     resp_error(err);
-    fflush(stdout);
     return;
   }
-  if (!check_arity(spec, argc)) {
-    fflush(stdout);
+  if (!check_arity(spec, argc))
     return;
-  }
 
+  /* ... unchanged branches for PING .. ZCARD, RENAME, DEL, EXISTS, KEYS, TYPE
+   * ... */
   if (strcmp(cmd, "PING") == 0) {
     if (argc == 1)
       resp_simple_string("PONG");
@@ -1242,20 +1222,15 @@ static void handle_command(Bulk args[], int argc) {
     }
     resp_integer(count);
   } else if (strcmp(cmd, "KEYS") == 0) {
-    /* only "*" required */
     int all = (args[1].len == 1 && args[1].data[0] == '*');
-    int n = 0;
-    for (size_t i = 0; i < DB.cap; i++) {
-      if (DB.slots[i].used != 1)
-        continue;
-      if (DB.slots[i].expire_at_ms != 0 && now_ms() >= DB.slots[i].expire_at_ms)
-        continue;
-      if (all)
-        n++;
-    }
     if (!all) {
       resp_array_header(0);
     } else {
+      int n = 0;
+      for (size_t i = 0; i < DB.cap; i++)
+        if (DB.slots[i].used == 1 && !(DB.slots[i].expire_at_ms != 0 &&
+                                       now_ms() >= DB.slots[i].expire_at_ms))
+          n++;
       resp_array_header(n);
       for (size_t i = 0; i < DB.cap; i++) {
         if (DB.slots[i].used != 1)
@@ -1677,11 +1652,11 @@ static void handle_command(Bulk args[], int argc) {
             withscores = 1;
           else {
             resp_error("ERR syntax error");
-            goto zrange_done;
+            return;
           }
         } else {
           resp_error("ERR syntax error");
-          goto zrange_done;
+          return;
         }
       }
       expire_if_needed_impl(args[1].data, args[1].len);
@@ -1717,7 +1692,6 @@ static void handle_command(Bulk args[], int argc) {
         free(sorted);
       }
     }
-  zrange_done:;
   } else if (strcmp(cmd, "ZRANK") == 0) {
     expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
@@ -1751,13 +1725,149 @@ static void handle_command(Bulk args[], int argc) {
     else
       resp_integer((long long)s->zset.count);
   }
-  fflush(stdout);
+}
+
+/* ============================================================
+ * Client transaction state
+ * ============================================================ */
+typedef struct {
+  Bulk *args;
+  int argc;
+} QueuedCmd;
+
+typedef struct {
+  int in_multi;
+  QueuedCmd *cmds;
+  int count, cap;
+} ClientState;
+
+static ClientState CLIENT = {0, NULL, 0, 0};
+
+static void free_queued_cmd(QueuedCmd *q) {
+  free_args(q->args, q->argc);
+  free(q->args);
+  q->args = NULL;
+  q->argc = 0;
+}
+static void free_queue(void) {
+  for (int i = 0; i < CLIENT.count; i++)
+    free_queued_cmd(&CLIENT.cmds[i]);
+  free(CLIENT.cmds);
+  CLIENT.cmds = NULL;
+  CLIENT.count = CLIENT.cap = 0;
+}
+static void enqueue(Bulk args[], int argc) {
+  if (CLIENT.count >= CLIENT.cap) {
+    CLIENT.cap = CLIENT.cap ? CLIENT.cap * 2 : 8;
+    CLIENT.cmds = realloc(CLIENT.cmds, sizeof(QueuedCmd) * (size_t)CLIENT.cap);
+  }
+  QueuedCmd *q = &CLIENT.cmds[CLIENT.count++];
+  q->argc = argc;
+  q->args = malloc(sizeof(Bulk) * (size_t)argc);
+  for (int i = 0; i < argc; i++) {
+    q->args[i].data = malloc((size_t)args[i].len);
+    memcpy(q->args[i].data, args[i].data, (size_t)args[i].len);
+    q->args[i].len = args[i].len;
+  }
+}
+
+/* ============================================================
+ * Top-level dispatcher: intercepts queuing for MULTI
+ * ============================================================ */
+static void handle_command(Bulk args[], int argc) {
+  if (argc == 0)
+    return;
+
+  /* Determine command name (uppercased) without allocating */
+  char cmd[256];
+  int cmdlen = args[0].len;
+  if (cmdlen > (int)sizeof(cmd) - 1)
+    cmdlen = (int)sizeof(cmd) - 1;
+  memcpy(cmd, args[0].data, (size_t)cmdlen);
+  cmd[cmdlen] = '\0';
+  for (int i = 0; i < cmdlen; i++)
+    cmd[i] = (char)toupper((unsigned char)cmd[i]);
+
+  if (strcmp(cmd, "MULTI") == 0) {
+    if (argc != 1) {
+      resp_error("ERR wrong number of arguments for 'multi' command");
+      return;
+    }
+    if (CLIENT.in_multi) {
+      resp_error("ERR MULTI calls can not be nested");
+      return;
+    }
+    CLIENT.in_multi = 1;
+    free_queue();
+    resp_simple_string("OK");
+    return;
+  }
+  if (strcmp(cmd, "DISCARD") == 0) {
+    if (argc != 1) {
+      resp_error("ERR wrong number of arguments for 'discard' command");
+      return;
+    }
+    if (!CLIENT.in_multi) {
+      resp_error("ERR DISCARD without MULTI");
+      return;
+    }
+    free_queue();
+    CLIENT.in_multi = 0;
+    resp_simple_string("OK");
+    return;
+  }
+  if (strcmp(cmd, "EXEC") == 0) {
+    if (argc != 1) {
+      resp_error("ERR wrong number of arguments for 'exec' command");
+      return;
+    }
+    if (!CLIENT.in_multi) {
+      resp_error("ERR EXEC without MULTI");
+      return;
+    }
+    int n = CLIENT.count;
+    char **pieces = malloc(sizeof(char *) * (size_t)(n > 0 ? n : 1));
+    size_t *lens = malloc(sizeof(size_t) * (size_t)(n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) {
+      char *buf = NULL;
+      size_t sz = 0;
+      FILE *mem = open_memstream(&buf, &sz);
+      FILE *saved = g_out;
+      g_out = mem;
+      execute_command(CLIENT.cmds[i].args, CLIENT.cmds[i].argc);
+      fflush(mem);
+      g_out = saved;
+      fclose(mem);
+      pieces[i] = buf;
+      lens[i] = sz;
+    }
+    resp_array_header(n);
+    for (int i = 0; i < n; i++) {
+      fwrite(pieces[i], 1, lens[i], g_out);
+      free(pieces[i]);
+    }
+    free(pieces);
+    free(lens);
+    free_queue();
+    CLIENT.in_multi = 0;
+    return;
+  }
+
+  /* Queue everything else if inside MULTI */
+  if (CLIENT.in_multi) {
+    enqueue(args, argc);
+    resp_simple_string("QUEUED");
+    return;
+  }
+
+  execute_command(args, argc);
 }
 
 /* ============================================================
  * Main
  * ============================================================ */
 int main(void) {
+  g_out = stdout;
   hm_init(&DB, 1024);
   Reader r;
   reader_init(&r);
@@ -1789,7 +1899,9 @@ int main(void) {
       }
       free(line);
     }
+    fflush(stdout);
   }
+  free_queue();
   reader_free(&r);
   hm_free(&DB);
   return 0;
