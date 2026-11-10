@@ -1,6 +1,5 @@
 #include <ctype.h>
 #include <limits.h>
-#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -268,7 +267,7 @@ static void resp_null_bulk(void) { printf("$-1\r\n"); }
 static void resp_array_header(int n) { printf("*%d\r\n", n); }
 
 /* ============================================================
- * Common FNV-1a
+ * FNV-1a
  * ============================================================ */
 static uint64_t fnv1a(const void *data, size_t len) {
   const unsigned char *p = (const unsigned char *)data;
@@ -281,7 +280,7 @@ static uint64_t fnv1a(const void *data, size_t len) {
 }
 
 /* ============================================================
- * Double parsing + score formatting
+ * Double helpers
  * ============================================================ */
 static int parse_double_strict(const char *s, int len, double *out) {
   if (len <= 0)
@@ -291,7 +290,6 @@ static int parse_double_strict(const char *s, int len, double *out) {
     return 0;
   memcpy(buf, s, (size_t)len);
   buf[len] = '\0';
-  /* reject leading/trailing whitespace and empty */
   if (buf[0] == ' ' || buf[0] == '\t')
     return 0;
   char *endp = NULL;
@@ -301,9 +299,7 @@ static int parse_double_strict(const char *s, int len, double *out) {
   *out = v;
   return 1;
 }
-
 static void format_score(double s, char *buf, int bufsize) {
-  /* whole-number fast path so 5 prints as "5", not "5.0" */
   if (s >= -9.22e18 && s <= 9.22e18) {
     long long ll = (long long)s;
     if ((double)ll == s) {
@@ -315,10 +311,9 @@ static void format_score(double s, char *buf, int bufsize) {
 }
 
 /* ============================================================
- * Hash (inner)
+ * Hash
  * ============================================================ */
 static uint64_t hash_seq_counter = 0;
-
 typedef struct HashField {
   char *field;
   int flen;
@@ -327,7 +322,6 @@ typedef struct HashField {
   int used;
   uint64_t seq;
 } HashField;
-
 typedef struct {
   HashField *entries;
   size_t cap, count;
@@ -427,7 +421,7 @@ static int cmp_hash_seq(const void *a, const void *b) {
 }
 
 /* ============================================================
- * Set (inner)
+ * Set
  * ============================================================ */
 typedef struct SetMember {
   char *data;
@@ -510,7 +504,7 @@ static int set_remove(Set *s, const char *data, int len) {
 }
 
 /* ============================================================
- * ZSet (inner) — member → score
+ * ZSet
  * ============================================================ */
 typedef struct ZSetEntry {
   char *member;
@@ -518,7 +512,6 @@ typedef struct ZSetEntry {
   double score;
   int used;
 } ZSetEntry;
-
 typedef struct {
   ZSetEntry *entries;
   size_t cap, count;
@@ -585,7 +578,6 @@ static int zset_add(ZSet *z, const char *m, int mlen, double score) {
   z->count++;
   return 1;
 }
-
 static int cmp_zset(const void *a, const void *b) {
   const ZSetEntry *ea = *(const ZSetEntry *const *)a;
   const ZSetEntry *eb = *(const ZSetEntry *const *)b;
@@ -603,7 +595,6 @@ static int cmp_zset(const void *a, const void *b) {
     return 1;
   return 0;
 }
-
 static ZSetEntry **zset_sorted(const ZSet *z, int *out_n) {
   int n = (int)z->count;
   *out_n = n;
@@ -634,7 +625,6 @@ typedef struct ListNode {
   int len;
   struct ListNode *prev, *next;
 } ListNode;
-
 typedef struct {
   ListNode *head, *tail;
   long len;
@@ -670,7 +660,6 @@ static void list_free(List *l) {
   l->head = l->tail = NULL;
   l->len = 0;
 }
-
 static void slot_clear(Slot *s) {
   free(s->key);
   s->key = NULL;
@@ -741,6 +730,22 @@ static Slot *hm_get(HashMap *m, const char *key, int klen) {
   size_t i = hm_find_slot(m, key, klen);
   return (m->slots[i].used == 1) ? &m->slots[i] : NULL;
 }
+
+/* Direct slot install (after clearing any prior occupant). Used by RENAME and
+ * by the SET-family helpers below. Caller supplies the payload already
+ * populated. */
+static Slot *hm_install_slot(HashMap *m, const char *key, int klen) {
+  if ((m->count + 1) * 10 >= m->cap * 7)
+    hm_grow(m);
+  size_t i = hm_find_slot(m, key, klen);
+  m->slots[i].used = 1;
+  m->slots[i].key = malloc((size_t)klen);
+  memcpy(m->slots[i].key, key, (size_t)klen);
+  m->slots[i].klen = klen;
+  m->count++;
+  return &m->slots[i];
+}
+
 static void hm_set_str(HashMap *m, const char *key, int klen, const char *val,
                        int vlen, long long expire_at_ms) {
   if ((m->count + 1) * 10 >= m->cap * 7)
@@ -886,6 +891,20 @@ static long hm_live_count(HashMap *m) {
       n++;
   return n;
 }
+static const char *type_name(ValueType t) {
+  switch (t) {
+  case T_LIST:
+    return "list";
+  case T_HASH:
+    return "hash";
+  case T_SET:
+    return "set";
+  case T_ZSET:
+    return "zset";
+  default:
+    return "string";
+  }
+}
 
 /* ============================================================
  * List operations
@@ -974,7 +993,6 @@ static int parse_ll_strict(const char *s, int len, long long *out) {
   *out = neg ? -v : v;
   return 1;
 }
-
 static void do_incr_by(Bulk args[], int key_idx, long long delta) {
   Bulk *key = &args[key_idx];
   expire_if_needed_impl(key->data, key->len);
@@ -1003,6 +1021,60 @@ static void do_incr_by(Bulk args[], int key_idx, long long delta) {
 }
 
 /* ============================================================
+ * RENAME (direct slot move)
+ * ============================================================ */
+static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
+  if (slen == dlen && memcmp(src, dst, (size_t)slen) == 0) {
+    /* same key: ok iff src exists */
+    expire_if_needed_impl(src, slen);
+    return hm_get(&DB, src, slen) != NULL;
+  }
+  expire_if_needed_impl(src, slen);
+  Slot *s = hm_get(&DB, src, slen);
+  if (!s)
+    return 0;
+  expire_if_needed_impl(dst, dlen);
+  Slot *d = hm_get(&DB, dst, dlen);
+  if (d) {
+    slot_clear(d);
+    DB.count--;
+  }
+
+  /* Take ownership of src's payload into a local struct */
+  Slot moved = *s;
+  /* Tombstone src WITHOUT freeing the payload pointers we just took */
+  s->key = NULL;
+  s->val = NULL;
+  s->klen = 0;
+  s->vlen = 0;
+  s->list.head = s->list.tail = NULL;
+  s->list.len = 0;
+  s->hash.entries = NULL;
+  s->hash.cap = s->hash.count = 0;
+  s->set.entries = NULL;
+  s->set.cap = s->set.count = 0;
+  s->zset.entries = NULL;
+  s->zset.cap = s->zset.count = 0;
+  s->expire_at_ms = 0;
+  s->type = T_STR;
+  s->used = 2;
+  DB.count--;
+
+  /* Install into dst */
+  if ((DB.count + 1) * 10 >= DB.cap * 7)
+    hm_grow(&DB);
+  size_t di = hm_find_slot(&DB, dst, dlen);
+  DB.slots[di] = moved;
+  DB.slots[di].used = 1;
+  free(DB.slots[di].key); /* drop src's key bytes */
+  DB.slots[di].key = malloc((size_t)dlen);
+  memcpy(DB.slots[di].key, dst, (size_t)dlen);
+  DB.slots[di].klen = dlen;
+  DB.count++;
+  return 1;
+}
+
+/* ============================================================
  * Command table
  * ============================================================ */
 typedef struct {
@@ -1013,7 +1085,8 @@ typedef struct {
 
 static const CommandSpec COMMANDS[] = {
     {"PING", 0, 1},     {"ECHO", 1, 1},      {"SET", 2, 6},    {"GET", 1, 1},
-    {"EXISTS", 1, 1},   {"DBSIZE", 0, 0},    {"INCR", 1, 1},   {"DECR", 1, 1},
+    {"DEL", 1, -1},     {"EXISTS", 1, -1},   {"KEYS", 1, 1},   {"TYPE", 1, 1},
+    {"RENAME", 2, 2},   {"DBSIZE", 0, 0},    {"INCR", 1, 1},   {"DECR", 1, 1},
     {"INCRBY", 2, 2},   {"DECRBY", 2, 2},    {"EXPIRE", 2, 2}, {"TTL", 1, 1},
     {"PTTL", 1, 1},     {"PERSIST", 1, 1},   {"WAIT", 1, 1},   {"LPUSH", 2, -1},
     {"RPUSH", 2, -1},   {"LRANGE", 3, 3},    {"LPOP", 1, 1},   {"RPOP", 1, 1},
@@ -1148,10 +1221,60 @@ static void handle_command(Bulk args[], int argc) {
       resp_error(WRONGTYPE_MSG);
     else
       resp_bulk(s->val, s->vlen);
+  } else if (strcmp(cmd, "DEL") == 0) {
+    int removed = 0;
+    for (int i = 1; i < argc; i++) {
+      expire_if_needed_impl(args[i].data, args[i].len);
+      Slot *s = hm_get(&DB, args[i].data, args[i].len);
+      if (s) {
+        slot_clear(s);
+        DB.count--;
+        removed++;
+      }
+    }
+    resp_integer(removed);
   } else if (strcmp(cmd, "EXISTS") == 0) {
+    int count = 0;
+    for (int i = 1; i < argc; i++) {
+      expire_if_needed_impl(args[i].data, args[i].len);
+      if (hm_get(&DB, args[i].data, args[i].len))
+        count++;
+    }
+    resp_integer(count);
+  } else if (strcmp(cmd, "KEYS") == 0) {
+    /* only "*" required */
+    int all = (args[1].len == 1 && args[1].data[0] == '*');
+    int n = 0;
+    for (size_t i = 0; i < DB.cap; i++) {
+      if (DB.slots[i].used != 1)
+        continue;
+      if (DB.slots[i].expire_at_ms != 0 && now_ms() >= DB.slots[i].expire_at_ms)
+        continue;
+      if (all)
+        n++;
+    }
+    if (!all) {
+      resp_array_header(0);
+    } else {
+      resp_array_header(n);
+      for (size_t i = 0; i < DB.cap; i++) {
+        if (DB.slots[i].used != 1)
+          continue;
+        if (DB.slots[i].expire_at_ms != 0 &&
+            now_ms() >= DB.slots[i].expire_at_ms)
+          continue;
+        resp_bulk(DB.slots[i].key, DB.slots[i].klen);
+      }
+    }
+  } else if (strcmp(cmd, "TYPE") == 0) {
     expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
-    resp_integer(s ? 1 : 0);
+    resp_simple_string(s ? type_name(s->type) : "none");
+  } else if (strcmp(cmd, "RENAME") == 0) {
+    if (hm_rename(args[1].data, args[1].len, args[2].data, args[2].len))
+      resp_simple_string("OK");
+    else
+      resp_error("ERR no such key");
   } else if (strcmp(cmd, "DBSIZE") == 0)
     resp_integer(hm_live_count(&DB));
   else if (strcmp(cmd, "INCR") == 0)
@@ -1275,7 +1398,6 @@ static void handle_command(Bulk args[], int argc) {
             lens[i] = cur->len;
             cur = cur->next;
           }
-        encode_array:
           resp_array_header(count);
           for (int i = 0; i < count; i++)
             resp_bulk(items[i], lens[i]);
@@ -1540,9 +1662,9 @@ static void handle_command(Bulk args[], int argc) {
   } else if (strcmp(cmd, "ZRANGE") == 0) {
     long long start, stop;
     if (!parse_ll_strict(args[2].data, args[2].len, &start) ||
-        !parse_ll_strict(args[3].data, args[3].len, &stop)) {
+        !parse_ll_strict(args[3].data, args[3].len, &stop))
       resp_error("ERR value is not an integer or out of range");
-    } else {
+    else {
       int withscores = 0;
       if (argc == 5) {
         if (args[4].len == 10) {
@@ -1569,8 +1691,7 @@ static void handle_command(Bulk args[], int argc) {
       else {
         int n_sorted = 0;
         ZSetEntry **sorted = s ? zset_sorted(&s->zset, &n_sorted) : NULL;
-        long n = n_sorted;
-        long st = start, sp = stop;
+        long n = n_sorted, st = start, sp = stop;
         if (st < 0)
           st += n;
         if (sp < 0)
@@ -1579,9 +1700,9 @@ static void handle_command(Bulk args[], int argc) {
           st = 0;
         if (sp >= n)
           sp = n - 1;
-        if (n == 0 || st > sp) {
+        if (n == 0 || st > sp)
           resp_array_header(0);
-        } else {
+        else {
           int count = (int)(sp - st + 1);
           resp_array_header(withscores ? count * 2 : count);
           for (long i = st; i <= sp; i++) {
