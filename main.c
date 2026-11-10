@@ -17,15 +17,9 @@ typedef struct {
 
 static FILE *g_out = NULL;
 
-/* ============================================================
- * Virtual clock
- * ============================================================ */
 static long long virtual_now_ms = 0;
 static long long now_ms(void) { return virtual_now_ms; }
 
-/* ============================================================
- * Buffered reader
- * ============================================================ */
 typedef struct {
   unsigned char *buf;
   size_t cap, len, pos;
@@ -140,9 +134,6 @@ static char *reader_read_rawline(Reader *r) {
   return out;
 }
 
-/* ============================================================
- * RESP request parsers
- * ============================================================ */
 static void free_args(Bulk args[], int argc) {
   for (int i = 0; i < argc; i++)
     free(args[i].data);
@@ -254,9 +245,6 @@ static int parse_text_request(char *line, Bulk args[], int max_args) {
   return count;
 }
 
-/* ============================================================
- * RESP serialization
- * ============================================================ */
 static void resp_simple_string(const char *s) { fprintf(g_out, "+%s\r\n", s); }
 static void resp_error(const char *msg) { fprintf(g_out, "-%s\r\n", msg); }
 static void resp_integer(long long n) { fprintf(g_out, ":%lld\r\n", n); }
@@ -269,9 +257,6 @@ static void resp_bulk(const char *data, int len) {
 static void resp_null_bulk(void) { fprintf(g_out, "$-1\r\n"); }
 static void resp_array_header(int n) { fprintf(g_out, "*%d\r\n", n); }
 
-/* ============================================================
- * FNV-1a
- * ============================================================ */
 static uint64_t fnv1a(const void *data, size_t len) {
   const unsigned char *p = (const unsigned char *)data;
   uint64_t h = 1469598103934665603ULL;
@@ -282,9 +267,6 @@ static uint64_t fnv1a(const void *data, size_t len) {
   return h;
 }
 
-/* ============================================================
- * Double helpers
- * ============================================================ */
 static int parse_double_strict(const char *s, int len, double *out) {
   if (len <= 0)
     return 0;
@@ -313,9 +295,6 @@ static void format_score(double s, char *buf, int bufsize) {
   snprintf(buf, bufsize, "%.17g", s);
 }
 
-/* ============================================================
- * Hash
- * ============================================================ */
 static uint64_t hash_seq_counter = 0;
 typedef struct HashField {
   char *field;
@@ -423,9 +402,6 @@ static int cmp_hash_seq(const void *a, const void *b) {
   return 0;
 }
 
-/* ============================================================
- * Set
- * ============================================================ */
 typedef struct SetMember {
   char *data;
   int len;
@@ -505,9 +481,6 @@ static int set_remove(Set *s, const char *data, int len) {
   return 1;
 }
 
-/* ============================================================
- * ZSet
- * ============================================================ */
 typedef struct ZSetEntry {
   char *member;
   int mlen;
@@ -610,9 +583,6 @@ static ZSetEntry **zset_sorted(const ZSet *z, int *out_n) {
   return arr;
 }
 
-/* ============================================================
- * Pub/Sub state
- * ============================================================ */
 typedef struct {
   char *name;
   int len;
@@ -690,9 +660,6 @@ static void pubsub_init(void) {
   }
 }
 
-/* ============================================================
- * Top-level store
- * ============================================================ */
 typedef enum {
   T_STR = 1,
   T_LIST = 2,
@@ -715,6 +682,8 @@ typedef struct {
   int klen;
   int used;
   long long expire_at_ms;
+  long long access_time;
+  uint64_t access_seq;
   ValueType type;
   char *val;
   int vlen;
@@ -760,6 +729,8 @@ static void slot_clear(Slot *s) {
   s->expire_at_ms = 0;
   s->type = T_STR;
   s->used = 2;
+  s->access_time = 0;
+  s->access_seq = 0;
 }
 static void hm_init(HashMap *m, size_t cap) {
   size_t c = 8;
@@ -843,6 +814,8 @@ static void hm_set_str(HashMap *m, const char *key, int klen, const char *val,
   m->slots[i].expire_at_ms = expire_at_ms;
   m->slots[i].list.head = m->slots[i].list.tail = NULL;
   m->slots[i].list.len = 0;
+  m->slots[i].access_time = 0;
+  m->slots[i].access_seq = 0;
   m->count++;
 }
 static void hm_set_list(HashMap *m, const char *key, int klen,
@@ -864,6 +837,8 @@ static void hm_set_list(HashMap *m, const char *key, int klen,
   m->slots[i].expire_at_ms = expire_at_ms;
   m->slots[i].list.head = m->slots[i].list.tail = NULL;
   m->slots[i].list.len = 0;
+  m->slots[i].access_time = 0;
+  m->slots[i].access_seq = 0;
   m->count++;
 }
 static void hm_set_hash(HashMap *m, const char *key, int klen,
@@ -886,6 +861,8 @@ static void hm_set_hash(HashMap *m, const char *key, int klen,
   m->slots[i].list.head = m->slots[i].list.tail = NULL;
   m->slots[i].list.len = 0;
   hash_init(&m->slots[i].hash);
+  m->slots[i].access_time = 0;
+  m->slots[i].access_seq = 0;
   m->count++;
 }
 static void hm_set_set(HashMap *m, const char *key, int klen,
@@ -908,6 +885,8 @@ static void hm_set_set(HashMap *m, const char *key, int klen,
   m->slots[i].list.head = m->slots[i].list.tail = NULL;
   m->slots[i].list.len = 0;
   set_init(&m->slots[i].set);
+  m->slots[i].access_time = 0;
+  m->slots[i].access_seq = 0;
   m->count++;
 }
 static void hm_set_zset(HashMap *m, const char *key, int klen,
@@ -930,10 +909,14 @@ static void hm_set_zset(HashMap *m, const char *key, int klen,
   m->slots[i].list.head = m->slots[i].list.tail = NULL;
   m->slots[i].list.len = 0;
   zset_init(&m->slots[i].zset);
+  m->slots[i].access_time = 0;
+  m->slots[i].access_seq = 0;
   m->count++;
 }
 
 static HashMap DB;
+static long long MAXKEYS = 0;
+static uint64_t access_seq_counter = 0;
 
 static int expire_if_needed_impl(const char *key, int klen) {
   Slot *s = hm_get(&DB, key, klen);
@@ -969,9 +952,47 @@ static const char *type_name(ValueType t) {
   }
 }
 
-/* ============================================================
- * List operations
- * ============================================================ */
+static void touch_slot(Slot *s) {
+  s->access_time = now_ms();
+  s->access_seq = ++access_seq_counter;
+}
+
+static void evict_lru_one(void) {
+  Slot *victim = NULL;
+  for (size_t i = 0; i < DB.cap; i++) {
+    Slot *s = &DB.slots[i];
+    if (s->used != 1)
+      continue;
+    if (s->expire_at_ms != 0 && now_ms() >= s->expire_at_ms)
+      continue;
+    if (!victim) {
+      victim = s;
+      continue;
+    }
+    if (s->access_time < victim->access_time ||
+        (s->access_time == victim->access_time &&
+         s->access_seq < victim->access_seq))
+      victim = s;
+  }
+  if (victim) {
+    slot_clear(victim);
+    DB.count--;
+  }
+}
+
+static void make_room_for_new_key(void) {
+  if (MAXKEYS <= 0)
+    return;
+  long live = hm_live_count(&DB);
+  while (live >= MAXKEYS) {
+    long before = live;
+    evict_lru_one();
+    live = hm_live_count(&DB);
+    if (live == before)
+      return;
+  }
+}
+
 static ListNode *list_node_new(const char *data, int len) {
   ListNode *n = malloc(sizeof *n);
   n->data = malloc((size_t)len);
@@ -1031,9 +1052,6 @@ static int list_pop_tail(List *l, char **out_data, int *out_len) {
   return 1;
 }
 
-/* ============================================================
- * Integer helpers
- * ============================================================ */
 static int parse_ll_strict(const char *s, int len, long long *out) {
   if (len <= 0)
     return 0;
@@ -1076,16 +1094,18 @@ static void do_incr_by(Bulk args[], int key_idx, long long delta) {
     resp_error("ERR increment or decrement would overflow");
     return;
   }
+  if (!s)
+    make_room_for_new_key();
   long long n = current + delta;
   char buf[32];
   int blen = snprintf(buf, sizeof(buf), "%lld", n);
   hm_set_str(&DB, key->data, key->len, buf, blen, 0);
+  s = hm_get(&DB, key->data, key->len);
+  if (s)
+    touch_slot(s);
   resp_integer(n);
 }
 
-/* ============================================================
- * RENAME
- * ============================================================ */
 static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
   if (slen == dlen && memcmp(src, dst, (size_t)slen) == 0) {
     expire_if_needed_impl(src, slen);
@@ -1117,6 +1137,8 @@ static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
   s->expire_at_ms = 0;
   s->type = T_STR;
   s->used = 2;
+  s->access_time = 0;
+  s->access_seq = 0;
   DB.count--;
   if ((DB.count + 1) * 10 >= DB.cap * 7)
     hm_grow(&DB);
@@ -1131,9 +1153,6 @@ static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
   return 1;
 }
 
-/* ============================================================
- * RDB SAVE / RESTORE helpers
- * ============================================================ */
 static int cmp_key_bytes(const void *a, const void *b) {
   const Bulk *ka = (const Bulk *)a;
   const Bulk *kb = (const Bulk *)b;
@@ -1309,9 +1328,6 @@ static void restore_line(const char *line, int len) {
   }
 }
 
-/* ============================================================
- * AOF state
- * ============================================================ */
 typedef struct {
   char *line;
   int len;
@@ -1373,9 +1389,6 @@ static void aof_append(Bulk args[], int argc) {
   AOF.count++;
 }
 
-/* ============================================================
- * Command table
- * ============================================================ */
 typedef struct {
   const char *name;
   int min_args;
@@ -1399,7 +1412,8 @@ static const CommandSpec COMMANDS[] = {
     {"ZRANK", 2, 2},        {"ZCARD", 1, 1},   {"MULTI", 0, 0},
     {"EXEC", 0, 0},         {"DISCARD", 0, 0}, {"SUBSCRIBE", 1, -1},
     {"UNSUBSCRIBE", 0, -1}, {"PUBLISH", 2, 2}, {"SAVE", 0, 0},
-    {"RESTORE", 1, 1},      {"AOF", 1, 1},
+    {"RESTORE", 1, 1},      {"AOF", 1, 1},     {"MAXKEYS", 1, 1},
+    {"INFO", 1, 1},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -1421,9 +1435,6 @@ static int check_arity(const CommandSpec *spec, int argc) {
   return 1;
 }
 
-/* ============================================================
- * EXECUTE
- * ============================================================ */
 static void execute_command(Bulk args[], int argc) {
   char cmd[256];
   int cmdlen = args[0].len;
@@ -1508,9 +1519,14 @@ static void execute_command(Bulk args[], int argc) {
       else if (s && s->type != T_STR)
         resp_error(WRONGTYPE_MSG);
       else {
+        if (!exists)
+          make_room_for_new_key();
         long long deadline = (ttl_ms > 0) ? now_ms() + ttl_ms : 0;
         hm_set_str(&DB, args[1].data, args[1].len, args[2].data, args[2].len,
                    deadline);
+        s = hm_get(&DB, args[1].data, args[1].len);
+        if (s)
+          touch_slot(s);
         resp_simple_string("OK");
       }
     }
@@ -1521,8 +1537,10 @@ static void execute_command(Bulk args[], int argc) {
       resp_null_bulk();
     else if (s->type != T_STR)
       resp_error(WRONGTYPE_MSG);
-    else
+    else {
+      touch_slot(s);
       resp_bulk(s->val, s->vlen);
+    }
   } else if (strcmp(cmd, "DEL") == 0) {
     int removed = 0;
     for (int i = 1; i < argc; i++) {
@@ -1650,6 +1668,7 @@ static void execute_command(Bulk args[], int argc) {
       resp_error(WRONGTYPE_MSG);
     else {
       if (!s) {
+        make_room_for_new_key();
         hm_set_list(&DB, args[1].data, args[1].len, 0);
         s = hm_get(&DB, args[1].data, args[1].len);
       }
@@ -1659,6 +1678,7 @@ static void execute_command(Bulk args[], int argc) {
         else
           list_push_tail(&s->list, args[i].data, args[i].len);
       }
+      touch_slot(s);
       resp_integer(s->list.len);
     }
   } else if (strcmp(cmd, "LRANGE") == 0) {
@@ -1672,6 +1692,8 @@ static void execute_command(Bulk args[], int argc) {
       if (s && s->type != T_LIST)
         resp_error(WRONGTYPE_MSG);
       else {
+        if (s)
+          touch_slot(s);
         long n = s ? s->list.len : 0;
         if (start < 0)
           start += n;
@@ -1719,6 +1741,7 @@ static void execute_command(Bulk args[], int argc) {
       if (!ok)
         resp_null_bulk();
       else {
+        touch_slot(s);
         resp_bulk(pdata, plen);
         free(pdata);
         if (s->list.len == 0) {
@@ -1734,8 +1757,10 @@ static void execute_command(Bulk args[], int argc) {
       resp_integer(0);
     else if (s->type != T_LIST)
       resp_error(WRONGTYPE_MSG);
-    else
+    else {
+      touch_slot(s);
       resp_integer(s->list.len);
+    }
   } else if (strcmp(cmd, "HSET") == 0) {
     int nargs = argc - 2;
     if (nargs % 2 != 0)
@@ -1747,6 +1772,7 @@ static void execute_command(Bulk args[], int argc) {
         resp_error(WRONGTYPE_MSG);
       else {
         if (!s) {
+          make_room_for_new_key();
           hm_set_hash(&DB, args[1].data, args[1].len, 0);
           s = hm_get(&DB, args[1].data, args[1].len);
         }
@@ -1754,6 +1780,7 @@ static void execute_command(Bulk args[], int argc) {
         for (int i = 2; i + 1 < argc; i += 2)
           new_count += hash_set(&s->hash, args[i].data, args[i].len,
                                 args[i + 1].data, args[i + 1].len);
+        touch_slot(s);
         resp_integer(new_count);
       }
     }
@@ -1768,8 +1795,10 @@ static void execute_command(Bulk args[], int argc) {
       HashField *f = hash_get(&s->hash, args[2].data, args[2].len);
       if (!f)
         resp_null_bulk();
-      else
+      else {
+        touch_slot(s);
         resp_bulk(f->value, f->vlen);
+      }
     }
   } else if (strcmp(cmd, "HDEL") == 0) {
     expire_if_needed_impl(args[1].data, args[1].len);
@@ -1782,6 +1811,7 @@ static void execute_command(Bulk args[], int argc) {
       int removed = 0;
       for (int i = 2; i < argc; i++)
         removed += hash_del(&s->hash, args[i].data, args[i].len);
+      touch_slot(s);
       if (s->hash.count == 0) {
         slot_clear(s);
         DB.count--;
@@ -1796,6 +1826,7 @@ static void execute_command(Bulk args[], int argc) {
     else if (s->type != T_HASH)
       resp_error(WRONGTYPE_MSG);
     else {
+      touch_slot(s);
       int live = (int)s->hash.count;
       if (live == 0)
         resp_array_header(0);
@@ -1821,8 +1852,10 @@ static void execute_command(Bulk args[], int argc) {
       resp_integer(0);
     else if (s->type != T_HASH)
       resp_error(WRONGTYPE_MSG);
-    else
+    else {
+      touch_slot(s);
       resp_integer(hash_get(&s->hash, args[2].data, args[2].len) ? 1 : 0);
+    }
   } else if (strcmp(cmd, "HLEN") == 0) {
     expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
@@ -1830,8 +1863,10 @@ static void execute_command(Bulk args[], int argc) {
       resp_integer(0);
     else if (s->type != T_HASH)
       resp_error(WRONGTYPE_MSG);
-    else
+    else {
+      touch_slot(s);
       resp_integer((long long)s->hash.count);
+    }
   } else if (strcmp(cmd, "SADD") == 0) {
     expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
@@ -1839,12 +1874,14 @@ static void execute_command(Bulk args[], int argc) {
       resp_error(WRONGTYPE_MSG);
     else {
       if (!s) {
+        make_room_for_new_key();
         hm_set_set(&DB, args[1].data, args[1].len, 0);
         s = hm_get(&DB, args[1].data, args[1].len);
       }
       int added = 0;
       for (int i = 2; i < argc; i++)
         added += set_add(&s->set, args[i].data, args[i].len);
+      touch_slot(s);
       resp_integer(added);
     }
   } else if (strcmp(cmd, "SMEMBERS") == 0) {
@@ -1855,6 +1892,7 @@ static void execute_command(Bulk args[], int argc) {
     else if (s->type != T_SET)
       resp_error(WRONGTYPE_MSG);
     else {
+      touch_slot(s);
       int n = (int)s->set.count;
       if (n == 0)
         resp_array_header(0);
@@ -1882,8 +1920,10 @@ static void execute_command(Bulk args[], int argc) {
       resp_integer(0);
     else if (s->type != T_SET)
       resp_error(WRONGTYPE_MSG);
-    else
+    else {
+      touch_slot(s);
       resp_integer(set_get(&s->set, args[2].data, args[2].len) ? 1 : 0);
+    }
   } else if (strcmp(cmd, "SCARD") == 0) {
     expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
@@ -1891,8 +1931,10 @@ static void execute_command(Bulk args[], int argc) {
       resp_integer(0);
     else if (s->type != T_SET)
       resp_error(WRONGTYPE_MSG);
-    else
+    else {
+      touch_slot(s);
       resp_integer((long long)s->set.count);
+    }
   } else if (strcmp(cmd, "SREM") == 0) {
     expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
@@ -1904,6 +1946,7 @@ static void execute_command(Bulk args[], int argc) {
       int removed = 0;
       for (int i = 2; i < argc; i++)
         removed += set_remove(&s->set, args[i].data, args[i].len);
+      touch_slot(s);
       if (s->set.count == 0) {
         slot_clear(s);
         DB.count--;
@@ -1921,6 +1964,7 @@ static void execute_command(Bulk args[], int argc) {
         resp_error(WRONGTYPE_MSG);
       else {
         if (!s) {
+          make_room_for_new_key();
           hm_set_zset(&DB, args[1].data, args[1].len, 0);
           s = hm_get(&DB, args[1].data, args[1].len);
         }
@@ -1935,8 +1979,10 @@ static void execute_command(Bulk args[], int argc) {
         }
         if (bad)
           resp_error("ERR value is not a valid float");
-        else
+        else {
+          touch_slot(s);
           resp_integer(added);
+        }
       }
     }
   } else if (strcmp(cmd, "ZSCORE") == 0) {
@@ -1951,6 +1997,7 @@ static void execute_command(Bulk args[], int argc) {
       if (!e)
         resp_null_bulk();
       else {
+        touch_slot(s);
         char buf[64];
         format_score(e->score, buf, sizeof(buf));
         resp_bulk(buf, (int)strlen(buf));
@@ -1986,6 +2033,8 @@ static void execute_command(Bulk args[], int argc) {
       if (s && s->type != T_ZSET)
         resp_error(WRONGTYPE_MSG);
       else {
+        if (s)
+          touch_slot(s);
         int n_sorted = 0;
         ZSetEntry **sorted = s ? zset_sorted(&s->zset, &n_sorted) : NULL;
         long n = n_sorted, st = start, sp = stop;
@@ -2022,6 +2071,7 @@ static void execute_command(Bulk args[], int argc) {
     else if (s->type != T_ZSET)
       resp_error(WRONGTYPE_MSG);
     else {
+      touch_slot(s);
       int n_sorted = 0;
       ZSetEntry **sorted = zset_sorted(&s->zset, &n_sorted);
       long rank = -1;
@@ -2044,8 +2094,10 @@ static void execute_command(Bulk args[], int argc) {
       resp_integer(0);
     else if (s->type != T_ZSET)
       resp_error(WRONGTYPE_MSG);
-    else
+    else {
+      touch_slot(s);
       resp_integer((long long)s->zset.count);
+    }
   } else if (strcmp(cmd, "SUBSCRIBE") == 0) {
     for (int i = 1; i < argc; i++) {
       ChannelEntry *ce = channels_ensure(&PUBSUB, args[i].data, args[i].len);
@@ -2194,12 +2246,33 @@ static void execute_command(Bulk args[], int argc) {
       resp_simple_string("OK");
     } else
       resp_error("ERR unknown subcommand");
+  } else if (strcmp(cmd, "MAXKEYS") == 0) {
+    long long n;
+    if (!parse_ll_strict(args[1].data, args[1].len, &n) || n < 0)
+      resp_error("ERR value is not an integer or out of range");
+    else {
+      MAXKEYS = n;
+      resp_simple_string("OK");
+    }
+  } else if (strcmp(cmd, "INFO") == 0) {
+    char sub[16];
+    int sl = args[1].len;
+    if (sl > (int)sizeof(sub) - 1)
+      sl = (int)sizeof(sub) - 1;
+    memcpy(sub, args[1].data, (size_t)sl);
+    sub[sl] = '\0';
+    for (int i = 0; i < sl; i++)
+      sub[i] = (char)toupper((unsigned char)sub[i]);
+    if (strcmp(sub, "MEMORY") == 0) {
+      char buf[128];
+      int n = snprintf(buf, sizeof(buf), "keys:%ld,maxkeys:%lld",
+                       hm_live_count(&DB), MAXKEYS);
+      resp_bulk(buf, n);
+    } else
+      resp_error("ERR unknown subcommand");
   }
 }
 
-/* ============================================================
- * Client transaction state
- * ============================================================ */
 typedef struct {
   Bulk *args;
   int argc;
@@ -2239,9 +2312,6 @@ static void enqueue(Bulk args[], int argc) {
   }
 }
 
-/* ============================================================
- * Top-level dispatcher
- * ============================================================ */
 static void handle_command(Bulk args[], int argc) {
   if (argc == 0)
     return;
@@ -2330,9 +2400,6 @@ static void handle_command(Bulk args[], int argc) {
   execute_command(args, argc);
 }
 
-/* ============================================================
- * Main
- * ============================================================ */
 int main(void) {
   g_out = stdout;
   pubsub_init();
