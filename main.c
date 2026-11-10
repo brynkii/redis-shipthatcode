@@ -6,6 +6,29 @@
 #define MAX_ARGS 64
 #define MAX_LINE 4096
 
+/* ---------- RESP serialization helpers ---------- */
+
+static void resp_simple_string(const char *s) { printf("+%s\r\n", s); }
+
+static void resp_error(const char *msg) { printf("-%s\r\n", msg); }
+
+static void resp_integer(long long n) { printf(":%lld\r\n", n); }
+
+static void resp_bulk_string(const char *data, int len) {
+  printf("$%d\r\n", len);
+  if (len > 0)
+    fwrite(data, 1, (size_t)len, stdout);
+  printf("\r\n");
+}
+
+static void resp_bulk_cstr(const char *s) {
+  resp_bulk_string(s, (int)strlen(s));
+}
+
+static void resp_null_bulk(void) { printf("$-1\r\n"); }
+
+/* ---------- argument parsing (unchanged) ---------- */
+
 int parse_args(char *line, char *args[], int max_args) {
   int count = 0;
   int in_quotes = 0;
@@ -30,50 +53,71 @@ int parse_args(char *line, char *args[], int max_args) {
       start = p;
     }
   }
-  if (start)
+  if (start && count < max_args)
     args[count++] = start;
   return count;
 }
 
 void str_toupper(char *s) {
   for (; *s; s++)
-    *s = toupper(*s);
+    *s = toupper((unsigned char)*s);
 }
+
+/* ---------- command handling ---------- */
 
 void handle_command(char *args[], int argc) {
   char cmd[256];
   strncpy(cmd, args[0], sizeof(cmd) - 1);
+  cmd[sizeof(cmd) - 1] = '\0';
   str_toupper(cmd);
 
   if (strcmp(cmd, "PING") == 0) {
     if (argc == 1) {
-      printf("+PONG\r\n");
+      resp_simple_string("PONG");
+    } else if (argc == 2) {
+      resp_bulk_cstr(args[1]);
     } else {
-      printf("$%d\r\n%s\r\n", (int)strlen(args[1]), args[1]);
-    }
-    fflush(stdout);
-    return;
-  }
-  if (strcmp(cmd, "ECHO") == 0) {
-    if (argc != 2) {
-      printf("-ERR wrong number of arguments for 'echo' command\r\n");
-    } else {
-      printf("$%d\r\n%s\r\n", (int)strlen(args[1]), args[1]);
+      resp_error("ERR wrong number of arguments for 'ping' command");
     }
     fflush(stdout);
     return;
   }
 
-  printf("-ERR unknown command\r\n");
+  if (strcmp(cmd, "ECHO") == 0) {
+    if (argc != 2) {
+      resp_error("ERR wrong number of arguments for 'echo' command");
+    } else {
+      resp_bulk_cstr(args[1]);
+    }
+    fflush(stdout);
+    return;
+  }
+
+  if (strcmp(cmd, "COMMAND") == 0) {
+    if (argc == 2 && strcmp(args[1], "DOCS") == 0) {
+      resp_simple_string("OK");
+    } else {
+      resp_error(
+          "ERR unknown subcommand or wrong number of arguments for 'command'");
+    }
+    fflush(stdout);
+    return;
+  }
+
+  /* unknown command: echo back the original (case-preserved) command name */
+  char err[512];
+  snprintf(err, sizeof(err), "ERR unknown command '%s'", args[0]);
+  resp_error(err);
   fflush(stdout);
 }
 
-int main() {
+/* ---------- main (unchanged) ---------- */
+
+int main(void) {
   char line[MAX_LINE];
   char *args[MAX_ARGS];
 
   while (fgets(line, sizeof(line), stdin)) {
-    /* trim newline */
     line[strcspn(line, "\r\n")] = '\0';
     if (line[0] == '\0')
       continue;
