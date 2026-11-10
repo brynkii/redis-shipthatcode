@@ -17,9 +17,15 @@ typedef struct {
 
 static FILE *g_out = NULL;
 
+/* ============================================================
+ * Virtual clock
+ * ============================================================ */
 static long long virtual_now_ms = 0;
 static long long now_ms(void) { return virtual_now_ms; }
 
+/* ============================================================
+ * Buffered reader
+ * ============================================================ */
 typedef struct {
   unsigned char *buf;
   size_t cap, len, pos;
@@ -134,6 +140,9 @@ static char *reader_read_rawline(Reader *r) {
   return out;
 }
 
+/* ============================================================
+ * RESP request parsers
+ * ============================================================ */
 static void free_args(Bulk args[], int argc) {
   for (int i = 0; i < argc; i++)
     free(args[i].data);
@@ -245,6 +254,9 @@ static int parse_text_request(char *line, Bulk args[], int max_args) {
   return count;
 }
 
+/* ============================================================
+ * RESP serialization
+ * ============================================================ */
 static void resp_simple_string(const char *s) { fprintf(g_out, "+%s\r\n", s); }
 static void resp_error(const char *msg) { fprintf(g_out, "-%s\r\n", msg); }
 static void resp_integer(long long n) { fprintf(g_out, ":%lld\r\n", n); }
@@ -257,6 +269,9 @@ static void resp_bulk(const char *data, int len) {
 static void resp_null_bulk(void) { fprintf(g_out, "$-1\r\n"); }
 static void resp_array_header(int n) { fprintf(g_out, "*%d\r\n", n); }
 
+/* ============================================================
+ * FNV-1a
+ * ============================================================ */
 static uint64_t fnv1a(const void *data, size_t len) {
   const unsigned char *p = (const unsigned char *)data;
   uint64_t h = 1469598103934665603ULL;
@@ -267,6 +282,9 @@ static uint64_t fnv1a(const void *data, size_t len) {
   return h;
 }
 
+/* ============================================================
+ * Double helpers
+ * ============================================================ */
 static int parse_double_strict(const char *s, int len, double *out) {
   if (len <= 0)
     return 0;
@@ -295,6 +313,9 @@ static void format_score(double s, char *buf, int bufsize) {
   snprintf(buf, bufsize, "%.17g", s);
 }
 
+/* ============================================================
+ * Hash
+ * ============================================================ */
 static uint64_t hash_seq_counter = 0;
 typedef struct HashField {
   char *field;
@@ -402,6 +423,9 @@ static int cmp_hash_seq(const void *a, const void *b) {
   return 0;
 }
 
+/* ============================================================
+ * Set
+ * ============================================================ */
 typedef struct SetMember {
   char *data;
   int len;
@@ -481,6 +505,9 @@ static int set_remove(Set *s, const char *data, int len) {
   return 1;
 }
 
+/* ============================================================
+ * ZSet
+ * ============================================================ */
 typedef struct ZSetEntry {
   char *member;
   int mlen;
@@ -583,6 +610,9 @@ static ZSetEntry **zset_sorted(const ZSet *z, int *out_n) {
   return arr;
 }
 
+/* ============================================================
+ * Pub/Sub state
+ * ============================================================ */
 typedef struct {
   char *name;
   int len;
@@ -660,6 +690,9 @@ static void pubsub_init(void) {
   }
 }
 
+/* ============================================================
+ * Top-level store
+ * ============================================================ */
 typedef enum {
   T_STR = 1,
   T_LIST = 2,
@@ -918,6 +951,79 @@ static HashMap DB;
 static long long MAXKEYS = 0;
 static uint64_t access_seq_counter = 0;
 
+/* ============================================================
+ * Version map (per-key, survives DEL)
+ * ============================================================ */
+typedef struct {
+  char *key;
+  int klen;
+  long long version;
+  int used;
+} VerEntry;
+typedef struct {
+  VerEntry *entries;
+  size_t cap, count;
+} VersionMap;
+static VersionMap VERSIONS = {0};
+
+static size_t ver_find_slot(const VersionMap *v, const char *key, int klen) {
+  uint64_t h = fnv1a(key, (size_t)klen);
+  size_t mask = v->cap - 1, i = (size_t)h & mask, first_tomb = (size_t)-1;
+  while (v->entries[i].used != 0) {
+    if (v->entries[i].used == 1 && v->entries[i].klen == klen &&
+        memcmp(v->entries[i].key, key, (size_t)klen) == 0)
+      return i;
+    if (v->entries[i].used == 2 && first_tomb == (size_t)-1)
+      first_tomb = i;
+    i = (i + 1) & mask;
+  }
+  return (first_tomb != (size_t)-1) ? first_tomb : i;
+}
+static void ver_grow(VersionMap *v) {
+  size_t newcap = v->cap * 2;
+  VerEntry *old = v->entries;
+  size_t oldcap = v->cap;
+  v->entries = calloc(newcap, sizeof(VerEntry));
+  v->cap = newcap;
+  v->count = 0;
+  for (size_t i = 0; i < oldcap; i++)
+    if (old[i].used == 1) {
+      size_t j = ver_find_slot(v, old[i].key, old[i].klen);
+      v->entries[j] = old[i];
+      v->count++;
+    }
+  free(old);
+}
+static long long ver_get_or_zero(const char *key, int klen) {
+  if (VERSIONS.cap == 0)
+    return 0;
+  size_t i = ver_find_slot(&VERSIONS, key, klen);
+  return (VERSIONS.entries[i].used == 1) ? VERSIONS.entries[i].version : 0;
+}
+static void ver_bump(const char *key, int klen) {
+  if (VERSIONS.cap == 0) {
+    VERSIONS.cap = 8;
+    VERSIONS.count = 0;
+    VERSIONS.entries = calloc(VERSIONS.cap, sizeof(VerEntry));
+  }
+  if ((VERSIONS.count + 1) * 10 >= VERSIONS.cap * 7)
+    ver_grow(&VERSIONS);
+  size_t i = ver_find_slot(&VERSIONS, key, klen);
+  if (VERSIONS.entries[i].used == 1) {
+    VERSIONS.entries[i].version++;
+    return;
+  }
+  VERSIONS.entries[i].used = 1;
+  VERSIONS.entries[i].key = malloc((size_t)klen);
+  memcpy(VERSIONS.entries[i].key, key, (size_t)klen);
+  VERSIONS.entries[i].klen = klen;
+  VERSIONS.entries[i].version = 1;
+  VERSIONS.count++;
+}
+
+/* ============================================================
+ * Access-time helpers
+ * ============================================================ */
 static int expire_if_needed_impl(const char *key, int klen) {
   Slot *s = hm_get(&DB, key, klen);
   if (!s)
@@ -925,6 +1031,7 @@ static int expire_if_needed_impl(const char *key, int klen) {
   if (s->expire_at_ms != 0 && now_ms() >= s->expire_at_ms) {
     slot_clear(s);
     DB.count--;
+    ver_bump(key, klen);
     return 1;
   }
   return 0;
@@ -975,8 +1082,13 @@ static void evict_lru_one(void) {
       victim = s;
   }
   if (victim) {
+    char *save_key = malloc((size_t)victim->klen);
+    int save_klen = victim->klen;
+    memcpy(save_key, victim->key, (size_t)victim->klen);
     slot_clear(victim);
     DB.count--;
+    ver_bump(save_key, save_klen);
+    free(save_key);
   }
 }
 
@@ -993,6 +1105,9 @@ static void make_room_for_new_key(void) {
   }
 }
 
+/* ============================================================
+ * List operations
+ * ============================================================ */
 static ListNode *list_node_new(const char *data, int len) {
   ListNode *n = malloc(sizeof *n);
   n->data = malloc((size_t)len);
@@ -1052,6 +1167,9 @@ static int list_pop_tail(List *l, char **out_data, int *out_len) {
   return 1;
 }
 
+/* ============================================================
+ * Integer helpers
+ * ============================================================ */
 static int parse_ll_strict(const char *s, int len, long long *out) {
   if (len <= 0)
     return 0;
@@ -1103,9 +1221,13 @@ static void do_incr_by(Bulk args[], int key_idx, long long delta) {
   s = hm_get(&DB, key->data, key->len);
   if (s)
     touch_slot(s);
+  ver_bump(key->data, key->len);
   resp_integer(n);
 }
 
+/* ============================================================
+ * RENAME
+ * ============================================================ */
 static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
   if (slen == dlen && memcmp(src, dst, (size_t)slen) == 0) {
     expire_if_needed_impl(src, slen);
@@ -1150,9 +1272,14 @@ static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
   memcpy(DB.slots[di].key, dst, (size_t)dlen);
   DB.slots[di].klen = dlen;
   DB.count++;
+  ver_bump(src, slen);
+  ver_bump(dst, dlen);
   return 1;
 }
 
+/* ============================================================
+ * RDB SAVE / RESTORE helpers
+ * ============================================================ */
 static int cmp_key_bytes(const void *a, const void *b) {
   const Bulk *ka = (const Bulk *)a;
   const Bulk *kb = (const Bulk *)b;
@@ -1328,6 +1455,9 @@ static void restore_line(const char *line, int len) {
   }
 }
 
+/* ============================================================
+ * AOF state
+ * ============================================================ */
 typedef struct {
   char *line;
   int len;
@@ -1389,6 +1519,9 @@ static void aof_append(Bulk args[], int argc) {
   AOF.count++;
 }
 
+/* ============================================================
+ * Command table
+ * ============================================================ */
 typedef struct {
   const char *name;
   int min_args;
@@ -1413,7 +1546,7 @@ static const CommandSpec COMMANDS[] = {
     {"EXEC", 0, 0},         {"DISCARD", 0, 0}, {"SUBSCRIBE", 1, -1},
     {"UNSUBSCRIBE", 0, -1}, {"PUBLISH", 2, 2}, {"SAVE", 0, 0},
     {"RESTORE", 1, 1},      {"AOF", 1, 1},     {"MAXKEYS", 1, 1},
-    {"INFO", 1, 1},
+    {"INFO", 1, 1},         {"WATCH", 1, -1},  {"UNWATCH", 0, 0},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -1435,6 +1568,9 @@ static int check_arity(const CommandSpec *spec, int argc) {
   return 1;
 }
 
+/* ============================================================
+ * EXECUTE
+ * ============================================================ */
 static void execute_command(Bulk args[], int argc) {
   char cmd[256];
   int cmdlen = args[0].len;
@@ -1527,6 +1663,7 @@ static void execute_command(Bulk args[], int argc) {
         s = hm_get(&DB, args[1].data, args[1].len);
         if (s)
           touch_slot(s);
+        ver_bump(args[1].data, args[1].len);
         resp_simple_string("OK");
       }
     }
@@ -1549,6 +1686,7 @@ static void execute_command(Bulk args[], int argc) {
       if (s) {
         slot_clear(s);
         DB.count--;
+        ver_bump(args[i].data, args[i].len);
         removed++;
       }
     }
@@ -1622,9 +1760,11 @@ static void execute_command(Bulk args[], int argc) {
       else if (secs <= 0) {
         slot_clear(s);
         DB.count--;
+        ver_bump(args[1].data, args[1].len);
         resp_integer(1);
       } else {
         s->expire_at_ms = now_ms() + secs * 1000LL;
+        ver_bump(args[1].data, args[1].len);
         resp_integer(1);
       }
     }
@@ -1650,6 +1790,7 @@ static void execute_command(Bulk args[], int argc) {
       resp_integer(0);
     else {
       s->expire_at_ms = 0;
+      ver_bump(args[1].data, args[1].len);
       resp_integer(1);
     }
   } else if (strcmp(cmd, "WAIT") == 0) {
@@ -1679,6 +1820,7 @@ static void execute_command(Bulk args[], int argc) {
           list_push_tail(&s->list, args[i].data, args[i].len);
       }
       touch_slot(s);
+      ver_bump(args[1].data, args[1].len);
       resp_integer(s->list.len);
     }
   } else if (strcmp(cmd, "LRANGE") == 0) {
@@ -1744,6 +1886,7 @@ static void execute_command(Bulk args[], int argc) {
         touch_slot(s);
         resp_bulk(pdata, plen);
         free(pdata);
+        ver_bump(args[1].data, args[1].len);
         if (s->list.len == 0) {
           slot_clear(s);
           DB.count--;
@@ -1781,6 +1924,7 @@ static void execute_command(Bulk args[], int argc) {
           new_count += hash_set(&s->hash, args[i].data, args[i].len,
                                 args[i + 1].data, args[i + 1].len);
         touch_slot(s);
+        ver_bump(args[1].data, args[1].len);
         resp_integer(new_count);
       }
     }
@@ -1812,6 +1956,8 @@ static void execute_command(Bulk args[], int argc) {
       for (int i = 2; i < argc; i++)
         removed += hash_del(&s->hash, args[i].data, args[i].len);
       touch_slot(s);
+      if (removed > 0)
+        ver_bump(args[1].data, args[1].len);
       if (s->hash.count == 0) {
         slot_clear(s);
         DB.count--;
@@ -1882,6 +2028,7 @@ static void execute_command(Bulk args[], int argc) {
       for (int i = 2; i < argc; i++)
         added += set_add(&s->set, args[i].data, args[i].len);
       touch_slot(s);
+      ver_bump(args[1].data, args[1].len);
       resp_integer(added);
     }
   } else if (strcmp(cmd, "SMEMBERS") == 0) {
@@ -1947,6 +2094,8 @@ static void execute_command(Bulk args[], int argc) {
       for (int i = 2; i < argc; i++)
         removed += set_remove(&s->set, args[i].data, args[i].len);
       touch_slot(s);
+      if (removed > 0)
+        ver_bump(args[1].data, args[1].len);
       if (s->set.count == 0) {
         slot_clear(s);
         DB.count--;
@@ -1981,6 +2130,7 @@ static void execute_command(Bulk args[], int argc) {
           resp_error("ERR value is not a valid float");
         else {
           touch_slot(s);
+          ver_bump(args[1].data, args[1].len);
           resp_integer(added);
         }
       }
@@ -2177,6 +2327,9 @@ static void execute_command(Bulk args[], int argc) {
     }
     resp_simple_string("OK");
   } else if (strcmp(cmd, "RESTORE") == 0) {
+    for (size_t i = 0; i < DB.cap; i++)
+      if (DB.slots[i].used == 1)
+        ver_bump(DB.slots[i].key, DB.slots[i].klen);
     hm_free(&DB);
     hm_init(&DB, 1024);
     const char *data = args[1].data;
@@ -2192,6 +2345,9 @@ static void execute_command(Bulk args[], int argc) {
         start = i + 1;
       }
     }
+    for (size_t i = 0; i < DB.cap; i++)
+      if (DB.slots[i].used == 1)
+        ver_bump(DB.slots[i].key, DB.slots[i].klen);
     resp_simple_string("OK");
   } else if (strcmp(cmd, "AOF") == 0) {
     char sub[16];
@@ -2270,19 +2426,35 @@ static void execute_command(Bulk args[], int argc) {
       resp_bulk(buf, n);
     } else
       resp_error("ERR unknown subcommand");
+  } else if (strcmp(cmd, "WATCH") == 0) {
+    /* inside MULTI: error. handled in handle_command, so this only runs
+     * when not in MULTI. */
+    resp_error("ERR WATCH inside MULTI is not allowed");
+  } else if (strcmp(cmd, "UNWATCH") == 0) {
+    resp_error("ERR UNWATCH inside MULTI is not allowed");
   }
 }
 
+/* ============================================================
+ * Client state (MULTI queue + WATCH set)
+ * ============================================================ */
 typedef struct {
   Bulk *args;
   int argc;
 } QueuedCmd;
 typedef struct {
+  char *key;
+  int klen;
+  long long snap;
+} WatchedKey;
+typedef struct {
   int in_multi;
   QueuedCmd *cmds;
   int count, cap;
+  WatchedKey *watched;
+  int wcount, wcap;
 } ClientState;
-static ClientState CLIENT = {0, NULL, 0, 0};
+static ClientState CLIENT = {0, NULL, 0, 0, NULL, 0, 0};
 
 static void free_queued_cmd(QueuedCmd *q) {
   free_args(q->args, q->argc);
@@ -2312,6 +2484,38 @@ static void enqueue(Bulk args[], int argc) {
   }
 }
 
+static void watch_clear(void) {
+  for (int i = 0; i < CLIENT.wcount; i++)
+    free(CLIENT.watched[i].key);
+  free(CLIENT.watched);
+  CLIENT.watched = NULL;
+  CLIENT.wcount = CLIENT.wcap = 0;
+}
+static void watch_add(const char *key, int klen, long long snap) {
+  if (CLIENT.wcount >= CLIENT.wcap) {
+    CLIENT.wcap = CLIENT.wcap ? CLIENT.wcap * 2 : 8;
+    CLIENT.watched =
+        realloc(CLIENT.watched, sizeof(WatchedKey) * (size_t)CLIENT.wcap);
+  }
+  WatchedKey *w = &CLIENT.watched[CLIENT.wcount++];
+  w->key = malloc((size_t)klen);
+  memcpy(w->key, key, (size_t)klen);
+  w->klen = klen;
+  w->snap = snap;
+}
+static int watch_is_dirty(void) {
+  for (int i = 0; i < CLIENT.wcount; i++) {
+    long long cur =
+        ver_get_or_zero(CLIENT.watched[i].key, CLIENT.watched[i].klen);
+    if (cur != CLIENT.watched[i].snap)
+      return 1;
+  }
+  return 0;
+}
+
+/* ============================================================
+ * Top-level dispatcher
+ * ============================================================ */
 static void handle_command(Bulk args[], int argc) {
   if (argc == 0)
     return;
@@ -2348,6 +2552,7 @@ static void handle_command(Bulk args[], int argc) {
       return;
     }
     free_queue();
+    watch_clear();
     CLIENT.in_multi = 0;
     resp_simple_string("OK");
     return;
@@ -2361,6 +2566,15 @@ static void handle_command(Bulk args[], int argc) {
       resp_error("ERR EXEC without MULTI");
       return;
     }
+
+    if (watch_is_dirty()) {
+      watch_clear();
+      free_queue();
+      CLIENT.in_multi = 0;
+      resp_null_bulk();
+      return;
+    }
+
     int n = CLIENT.count;
     char **pieces = malloc(sizeof(char *) * (size_t)(n > 0 ? n : 1));
     size_t *lens = malloc(sizeof(size_t) * (size_t)(n > 0 ? n : 1));
@@ -2385,7 +2599,38 @@ static void handle_command(Bulk args[], int argc) {
     free(pieces);
     free(lens);
     free_queue();
+    watch_clear();
     CLIENT.in_multi = 0;
+    return;
+  }
+  if (strcmp(cmd, "WATCH") == 0) {
+    if (argc < 2) {
+      resp_error("ERR wrong number of arguments for 'watch' command");
+      return;
+    }
+    if (CLIENT.in_multi) {
+      resp_error("ERR WATCH inside MULTI is not allowed");
+      return;
+    }
+    watch_clear();
+    for (int i = 1; i < argc; i++) {
+      long long snap = ver_get_or_zero(args[i].data, args[i].len);
+      watch_add(args[i].data, args[i].len, snap);
+    }
+    resp_simple_string("OK");
+    return;
+  }
+  if (strcmp(cmd, "UNWATCH") == 0) {
+    if (argc != 1) {
+      resp_error("ERR wrong number of arguments for 'unwatch' command");
+      return;
+    }
+    if (CLIENT.in_multi) {
+      resp_error("ERR UNWATCH inside MULTI is not allowed");
+      return;
+    }
+    watch_clear();
+    resp_simple_string("OK");
     return;
   }
 
@@ -2400,6 +2645,9 @@ static void handle_command(Bulk args[], int argc) {
   execute_command(args, argc);
 }
 
+/* ============================================================
+ * Main
+ * ============================================================ */
 int main(void) {
   g_out = stdout;
   pubsub_init();
@@ -2437,6 +2685,7 @@ int main(void) {
     fflush(stdout);
   }
   free_queue();
+  watch_clear();
   for (int i = 0; i < AOF.count; i++)
     free(AOF.entries[i].line);
   free(AOF.entries);
