@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -373,6 +374,63 @@ static long hm_live_count(const HashMap *m) { return (long)m->count; }
 static HashMap DB;
 
 /* ============================================================
+ * Integer parsing / arithmetic helpers
+ * ============================================================ */
+
+/* Strict base-10 signed 64-bit parse: optional +/- sign, then digits only.
+ * Rejects "", "+", "-", "3.0", " 3", "0x10", and out-of-range. */
+static int parse_ll_strict(const char *s, int len, long long *out) {
+  if (len <= 0)
+    return 0;
+  int i = 0, neg = 0;
+  if (s[0] == '-' || s[0] == '+') {
+    neg = (s[0] == '-');
+    i = 1;
+  }
+  if (i >= len)
+    return 0;
+  long long v = 0;
+  for (; i < len; i++) {
+    if (s[i] < '0' || s[i] > '9')
+      return 0;
+    int d = s[i] - '0';
+    if (v > (9223372036854775807LL - d) / 10)
+      return 0;
+    v = v * 10 + d;
+  }
+  *out = neg ? -v : v;
+  return 1;
+}
+
+/* Core INCR-family operation: key (args[key_idx]) += delta.
+ * Missing key → current = 0. Writes back decimal, replies integer. */
+static void do_incr_by(Bulk args[], int key_idx, long long delta) {
+  Bulk *key = &args[key_idx];
+
+  long long current = 0;
+  Slot *s = hm_get(&DB, key->data, key->len);
+  if (s) {
+    if (!parse_ll_strict(s->val, s->vlen, &current)) {
+      resp_error("ERR value is not an integer or out of range");
+      return;
+    }
+  }
+
+  /* overflow guard: current + delta must fit in int64 */
+  if ((delta > 0 && current > LLONG_MAX - delta) ||
+      (delta < 0 && current < LLONG_MIN - delta)) {
+    resp_error("ERR increment or decrement would overflow");
+    return;
+  }
+  long long n = current + delta;
+
+  char buf[32];
+  int blen = snprintf(buf, sizeof(buf), "%lld", n);
+  hm_set(&DB, key->data, key->len, buf, blen);
+  resp_integer(n);
+}
+
+/* ============================================================
  * Command table + arity
  * ============================================================ */
 
@@ -383,9 +441,9 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1}, {"ECHO", 1, 1},
-    {"SET", 2, 4}, /* key value [NX|XX] [NX|XX] — validated in handler */
-    {"GET", 1, 1},  {"DBSIZE", 0, 0},
+    {"PING", 0, 1}, {"ECHO", 1, 1},   {"SET", 2, 4},
+    {"GET", 1, 1},  {"DBSIZE", 0, 0}, {"INCR", 1, 1},
+    {"DECR", 1, 1}, {"INCRBY", 2, 2}, {"DECRBY", 2, 2},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -443,9 +501,7 @@ static void handle_command(Bulk args[], int argc) {
   } else if (strcmp(cmd, "ECHO") == 0) {
     resp_bulk(args[1].data, args[1].len);
   } else if (strcmp(cmd, "SET") == 0) {
-    /* Generic flag loop over args[3..argc-1] */
     int nx = 0, xx = 0, bad_flag = 0;
-
     for (int i = 3; i < argc; i++) {
       char f[16];
       int flen = args[i].len;
@@ -457,7 +513,6 @@ static void handle_command(Bulk args[], int argc) {
       f[flen] = '\0';
       for (int k = 0; k < flen; k++)
         f[k] = (char)toupper((unsigned char)f[k]);
-
       if (strcmp(f, "NX") == 0)
         nx = 1;
       else if (strcmp(f, "XX") == 0)
@@ -467,7 +522,6 @@ static void handle_command(Bulk args[], int argc) {
         break;
       }
     }
-
     if (bad_flag || (nx && xx)) {
       resp_error("ERR syntax error");
     } else {
@@ -487,6 +541,26 @@ static void handle_command(Bulk args[], int argc) {
       resp_null_bulk();
   } else if (strcmp(cmd, "DBSIZE") == 0) {
     resp_integer(hm_live_count(&DB));
+  } else if (strcmp(cmd, "INCR") == 0) {
+    do_incr_by(args, 1, 1);
+  } else if (strcmp(cmd, "DECR") == 0) {
+    do_incr_by(args, 1, -1);
+  } else if (strcmp(cmd, "INCRBY") == 0) {
+    long long delta;
+    if (!parse_ll_strict(args[2].data, args[2].len, &delta)) {
+      resp_error("ERR value is not an integer or out of range");
+    } else {
+      do_incr_by(args, 1, delta);
+    }
+  } else if (strcmp(cmd, "DECRBY") == 0) {
+    long long delta;
+    if (!parse_ll_strict(args[2].data, args[2].len, &delta)) {
+      resp_error("ERR value is not an integer or out of range");
+    } else if (delta == LLONG_MIN) {
+      resp_error("ERR increment or decrement would overflow");
+    } else {
+      do_incr_by(args, 1, -delta);
+    }
   }
   fflush(stdout);
 }
