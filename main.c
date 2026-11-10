@@ -1133,6 +1133,195 @@ static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
 }
 
 /* ============================================================
+ * RDB SAVE / RESTORE helpers
+ * ============================================================ */
+static int cmp_key_bytes(const void *a, const void *b) {
+  const Bulk *ka = (const Bulk *)a;
+  const Bulk *kb = (const Bulk *)b;
+  int minlen = ka->len < kb->len ? ka->len : kb->len;
+  int c = memcmp(ka->data, kb->data, (size_t)minlen);
+  if (c != 0)
+    return c;
+  if (ka->len < kb->len)
+    return -1;
+  if (ka->len > kb->len)
+    return 1;
+  return 0;
+}
+
+/* Emit a single SAVE line: "KEY <type> <key> <payload>\r\n" */
+static void save_emit(Slot *s) {
+  fprintf(g_out, "KEY %s ", type_name(s->type));
+  fwrite(s->key, 1, (size_t)s->klen, g_out);
+  fprintf(g_out, " ");
+  switch (s->type) {
+  case T_STR:
+    fwrite(s->val, 1, (size_t)s->vlen, g_out);
+    break;
+  case T_LIST: {
+    int first = 1;
+    for (ListNode *n = s->list.head; n; n = n->next) {
+      if (!first)
+        fputc(',', g_out);
+      fwrite(n->data, 1, (size_t)n->len, g_out);
+      first = 0;
+    }
+    break;
+  }
+  case T_HASH: {
+    int live = (int)s->hash.count;
+    HashField **fields =
+        malloc(sizeof(HashField *) * (size_t)(live > 0 ? live : 1));
+    int k = 0;
+    for (size_t i = 0; i < s->hash.cap; i++)
+      if (s->hash.entries[i].used == 1)
+        fields[k++] = &s->hash.entries[i];
+    qsort(fields, (size_t)live, sizeof(HashField *), cmp_hash_seq);
+    for (int i = 0; i < live; i++) {
+      if (i > 0)
+        fputc(',', g_out);
+      fwrite(fields[i]->field, 1, (size_t)fields[i]->flen, g_out);
+      fputc('=', g_out);
+      fwrite(fields[i]->value, 1, (size_t)fields[i]->vlen, g_out);
+    }
+    free(fields);
+    break;
+  }
+  case T_SET: {
+    int first = 1;
+    for (size_t i = 0; i < s->set.cap; i++)
+      if (s->set.entries[i].used == 1) {
+        if (!first)
+          fputc(',', g_out);
+        fwrite(s->set.entries[i].data, 1, (size_t)s->set.entries[i].len, g_out);
+        first = 0;
+      }
+    break;
+  }
+  case T_ZSET: {
+    int n = 0;
+    ZSetEntry **sorted = zset_sorted(&s->zset, &n);
+    for (int i = 0; i < n; i++) {
+      if (i > 0)
+        fputc(',', g_out);
+      fwrite(sorted[i]->member, 1, (size_t)sorted[i]->mlen, g_out);
+      fputc('=', g_out);
+      char sbuf[64];
+      format_score(sorted[i]->score, sbuf, sizeof(sbuf));
+      fprintf(g_out, "%s", sbuf);
+    }
+    free(sorted);
+    break;
+  }
+  }
+  fprintf(g_out, "\r\n");
+}
+
+/* Parse one "KEY <type> <key> <payload>" line into DB. Skip on malformed. */
+static void restore_line(const char *line, int len) {
+  if (len <= 0)
+    return;
+  /* find first 3 spaces */
+  int sp1 = -1, sp2 = -1, sp3 = -1;
+  for (int i = 0; i < len; i++) {
+    if (line[i] == ' ') {
+      if (sp1 < 0)
+        sp1 = i;
+      else if (sp2 < 0)
+        sp2 = i;
+      else if (sp3 < 0) {
+        sp3 = i;
+        break;
+      }
+    }
+  }
+  if (sp1 < 0 || sp2 < 0)
+    return; /* "KEY <type>" then maybe nothing */
+  int tlen = sp2 - sp1 - 1;
+  const char *type = line + sp1 + 1;
+  const char *key = line + sp2 + 1;
+  int klen = (sp3 >= 0 ? sp3 - sp2 - 1 : len - sp2 - 1);
+  const char *payload = (sp3 >= 0) ? line + sp3 + 1 : NULL;
+  int plen = (sp3 >= 0) ? len - sp3 - 1 : 0;
+
+  if (tlen == 6 && memcmp(type, "string", 6) == 0) {
+    if (!payload)
+      return;
+    hm_set_str(&DB, key, klen, payload, plen, 0);
+  } else if (tlen == 4 && memcmp(type, "list", 4) == 0) {
+    if (!payload || plen == 0)
+      return;
+    hm_set_list(&DB, key, klen, 0);
+    Slot *s = hm_get(&DB, key, klen);
+    int start = 0;
+    for (int i = 0; i <= plen; i++) {
+      if (i == plen || payload[i] == ',') {
+        if (i > start)
+          list_push_tail(&s->list, payload + start, i - start);
+        start = i + 1;
+      }
+    }
+  } else if (tlen == 4 && memcmp(type, "hash", 4) == 0) {
+    if (!payload || plen == 0)
+      return;
+    hm_set_hash(&DB, key, klen, 0);
+    Slot *s = hm_get(&DB, key, klen);
+    int start = 0;
+    for (int i = 0; i <= plen; i++) {
+      if (i == plen || payload[i] == ',') {
+        /* pair: field=value, split at first '=' */
+        int eq = -1;
+        for (int j = start; j < i; j++)
+          if (payload[j] == '=') {
+            eq = j;
+            break;
+          }
+        if (eq > start) {
+          hash_set(&s->hash, payload + start, eq - start, payload + eq + 1,
+                   i - eq - 1);
+        }
+        start = i + 1;
+      }
+    }
+  } else if (tlen == 3 && memcmp(type, "set", 3) == 0) {
+    if (!payload || plen == 0)
+      return;
+    hm_set_set(&DB, key, klen, 0);
+    Slot *s = hm_get(&DB, key, klen);
+    int start = 0;
+    for (int i = 0; i <= plen; i++) {
+      if (i == plen || payload[i] == ',') {
+        if (i > start)
+          set_add(&s->set, payload + start, i - start);
+        start = i + 1;
+      }
+    }
+  } else if (tlen == 4 && memcmp(type, "zset", 4) == 0) {
+    if (!payload || plen == 0)
+      return;
+    hm_set_zset(&DB, key, klen, 0);
+    Slot *s = hm_get(&DB, key, klen);
+    int start = 0;
+    for (int i = 0; i <= plen; i++) {
+      if (i == plen || payload[i] == ',') {
+        int eq = -1;
+        for (int j = start; j < i; j++)
+          if (payload[j] == '=') {
+            eq = j;
+            break;
+          }
+        if (eq > start && eq + 1 < i) {
+          double sc;
+          if (parse_double_strict(payload + eq + 1, i - eq - 1, &sc))
+            zset_add(&s->zset, payload + start, eq - start, sc);
+        }
+        start = i + 1;
+      }
+    }
+  }
+}
+
+/* ============================================================
  * Command table
  * ============================================================ */
 typedef struct {
@@ -1157,7 +1346,8 @@ static const CommandSpec COMMANDS[] = {
     {"ZADD", 3, -1},        {"ZSCORE", 2, 2},  {"ZRANGE", 3, 4},
     {"ZRANK", 2, 2},        {"ZCARD", 1, 1},   {"MULTI", 0, 0},
     {"EXEC", 0, 0},         {"DISCARD", 0, 0}, {"SUBSCRIBE", 1, -1},
-    {"UNSUBSCRIBE", 0, -1}, {"PUBLISH", 2, 2},
+    {"UNSUBSCRIBE", 0, -1}, {"PUBLISH", 2, 2}, {"SAVE", 0, 0},
+    {"RESTORE", 1, 1},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -1861,6 +2051,46 @@ static void execute_command(Bulk args[], int argc) {
               args[2].len, args[2].data);
     }
     resp_integer(has_sub ? 1 : 0);
+  } else if (strcmp(cmd, "SAVE") == 0) {
+    /* Collect live keys, sort, emit */
+    int total = (int)hm_live_count(&DB);
+    if (total > 0) {
+      Bulk *keys = malloc(sizeof(Bulk) * (size_t)total);
+      int k = 0;
+      for (size_t i = 0; i < DB.cap; i++)
+        if (DB.slots[i].used == 1 && !(DB.slots[i].expire_at_ms != 0 &&
+                                       now_ms() >= DB.slots[i].expire_at_ms)) {
+          keys[k].data = DB.slots[i].key;
+          keys[k].len = DB.slots[i].klen;
+          k++;
+        }
+      qsort(keys, (size_t)total, sizeof(Bulk), cmp_key_bytes);
+      for (int i = 0; i < total; i++) {
+        Slot *s = hm_get(&DB, keys[i].data, keys[i].len);
+        if (s)
+          save_emit(s);
+      }
+      free(keys);
+    }
+    resp_simple_string("OK");
+  } else if (strcmp(cmd, "RESTORE") == 0) {
+    /* Wipe all keys, then parse lines from args[1] */
+    hm_free(&DB);
+    hm_init(&DB, 1024);
+    const char *data = args[1].data;
+    int dlen = args[1].len;
+    int start = 0;
+    for (int i = 0; i <= dlen; i++) {
+      if (i == dlen || data[i] == '\n') {
+        int end = i;
+        if (end > start && data[end - 1] == '\r')
+          end--;
+        if (end > start)
+          restore_line(data + start, end - start);
+        start = i + 1;
+      }
+    }
+    resp_simple_string("OK");
   }
 }
 
