@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
 #include <limits.h>
-#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1148,8 +1147,6 @@ static int cmp_key_bytes(const void *a, const void *b) {
     return 1;
   return 0;
 }
-
-/* Emit a single SAVE line: "KEY <type> <key> <payload>\r\n" */
 static void save_emit(Slot *s) {
   fprintf(g_out, "KEY %s ", type_name(s->type));
   fwrite(s->key, 1, (size_t)s->klen, g_out);
@@ -1216,12 +1213,9 @@ static void save_emit(Slot *s) {
   }
   fprintf(g_out, "\r\n");
 }
-
-/* Parse one "KEY <type> <key> <payload>" line into DB. Skip on malformed. */
 static void restore_line(const char *line, int len) {
   if (len <= 0)
     return;
-  /* find first 3 spaces */
   int sp1 = -1, sp2 = -1, sp3 = -1;
   for (int i = 0; i < len; i++) {
     if (line[i] == ' ') {
@@ -1236,7 +1230,7 @@ static void restore_line(const char *line, int len) {
     }
   }
   if (sp1 < 0 || sp2 < 0)
-    return; /* "KEY <type>" then maybe nothing */
+    return;
   int tlen = sp2 - sp1 - 1;
   const char *type = line + sp1 + 1;
   const char *key = line + sp2 + 1;
@@ -1254,55 +1248,50 @@ static void restore_line(const char *line, int len) {
     hm_set_list(&DB, key, klen, 0);
     Slot *s = hm_get(&DB, key, klen);
     int start = 0;
-    for (int i = 0; i <= plen; i++) {
+    for (int i = 0; i <= plen; i++)
       if (i == plen || payload[i] == ',') {
         if (i > start)
           list_push_tail(&s->list, payload + start, i - start);
         start = i + 1;
       }
-    }
   } else if (tlen == 4 && memcmp(type, "hash", 4) == 0) {
     if (!payload || plen == 0)
       return;
     hm_set_hash(&DB, key, klen, 0);
     Slot *s = hm_get(&DB, key, klen);
     int start = 0;
-    for (int i = 0; i <= plen; i++) {
+    for (int i = 0; i <= plen; i++)
       if (i == plen || payload[i] == ',') {
-        /* pair: field=value, split at first '=' */
         int eq = -1;
         for (int j = start; j < i; j++)
           if (payload[j] == '=') {
             eq = j;
             break;
           }
-        if (eq > start) {
+        if (eq > start)
           hash_set(&s->hash, payload + start, eq - start, payload + eq + 1,
                    i - eq - 1);
-        }
         start = i + 1;
       }
-    }
   } else if (tlen == 3 && memcmp(type, "set", 3) == 0) {
     if (!payload || plen == 0)
       return;
     hm_set_set(&DB, key, klen, 0);
     Slot *s = hm_get(&DB, key, klen);
     int start = 0;
-    for (int i = 0; i <= plen; i++) {
+    for (int i = 0; i <= plen; i++)
       if (i == plen || payload[i] == ',') {
         if (i > start)
           set_add(&s->set, payload + start, i - start);
         start = i + 1;
       }
-    }
   } else if (tlen == 4 && memcmp(type, "zset", 4) == 0) {
     if (!payload || plen == 0)
       return;
     hm_set_zset(&DB, key, klen, 0);
     Slot *s = hm_get(&DB, key, klen);
     int start = 0;
-    for (int i = 0; i <= plen; i++) {
+    for (int i = 0; i <= plen; i++)
       if (i == plen || payload[i] == ',') {
         int eq = -1;
         for (int j = start; j < i; j++)
@@ -1317,8 +1306,71 @@ static void restore_line(const char *line, int len) {
         }
         start = i + 1;
       }
-    }
   }
+}
+
+/* ============================================================
+ * AOF state
+ * ============================================================ */
+typedef struct {
+  char *line;
+  int len;
+} AofEntry;
+typedef struct {
+  int enabled;
+  AofEntry *entries;
+  int count, cap;
+} AofLog;
+static AofLog AOF = {0, NULL, 0, 0};
+
+static int is_write_command(const char *upper_cmd) {
+  static const char *writes[] = {"SET",  "DEL",    "LPUSH",  "RPUSH",   "LPOP",
+                                 "RPOP", "HSET",   "HDEL",   "SADD",    "SREM",
+                                 "ZADD", "EXPIRE", "RENAME", "RESTORE", "INCR",
+                                 "DECR", "INCRBY", "DECRBY", "PERSIST", NULL};
+  for (int i = 0; writes[i]; i++)
+    if (strcmp(writes[i], upper_cmd) == 0)
+      return 1;
+  return 0;
+}
+
+static void aof_serialize(Bulk args[], int argc, char **out_line,
+                          int *out_len) {
+  size_t cap = 16;
+  for (int i = 0; i < argc; i++)
+    cap += (size_t)args[i].len + 4;
+  char *buf = malloc(cap);
+  size_t pos = 0;
+  for (int i = 0; i < argc; i++) {
+    if (i > 0)
+      buf[pos++] = ' ';
+    int needs_quote = (args[i].len == 0);
+    for (int j = 0; j < args[i].len && !needs_quote; j++)
+      if (args[i].data[j] == ' ')
+        needs_quote = 1;
+    if (needs_quote)
+      buf[pos++] = '"';
+    memcpy(buf + pos, args[i].data, (size_t)args[i].len);
+    pos += (size_t)args[i].len;
+    if (needs_quote)
+      buf[pos++] = '"';
+  }
+  buf[pos] = '\0';
+  *out_line = buf;
+  *out_len = (int)pos;
+}
+
+static void aof_append(Bulk args[], int argc) {
+  char *line;
+  int len;
+  aof_serialize(args, argc, &line, &len);
+  if (AOF.count >= AOF.cap) {
+    AOF.cap = AOF.cap ? AOF.cap * 2 : 16;
+    AOF.entries = realloc(AOF.entries, sizeof(AofEntry) * (size_t)AOF.cap);
+  }
+  AOF.entries[AOF.count].line = line;
+  AOF.entries[AOF.count].len = len;
+  AOF.count++;
 }
 
 /* ============================================================
@@ -1347,7 +1399,7 @@ static const CommandSpec COMMANDS[] = {
     {"ZRANK", 2, 2},        {"ZCARD", 1, 1},   {"MULTI", 0, 0},
     {"EXEC", 0, 0},         {"DISCARD", 0, 0}, {"SUBSCRIBE", 1, -1},
     {"UNSUBSCRIBE", 0, -1}, {"PUBLISH", 2, 2}, {"SAVE", 0, 0},
-    {"RESTORE", 1, 1},
+    {"RESTORE", 1, 1},      {"AOF", 1, 1},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -1370,7 +1422,7 @@ static int check_arity(const CommandSpec *spec, int argc) {
 }
 
 /* ============================================================
- * EXECUTE — real per-command executor
+ * EXECUTE
  * ============================================================ */
 static void execute_command(Bulk args[], int argc) {
   char cmd[256];
@@ -2052,7 +2104,6 @@ static void execute_command(Bulk args[], int argc) {
     }
     resp_integer(has_sub ? 1 : 0);
   } else if (strcmp(cmd, "SAVE") == 0) {
-    /* Collect live keys, sort, emit */
     int total = (int)hm_live_count(&DB);
     if (total > 0) {
       Bulk *keys = malloc(sizeof(Bulk) * (size_t)total);
@@ -2074,7 +2125,6 @@ static void execute_command(Bulk args[], int argc) {
     }
     resp_simple_string("OK");
   } else if (strcmp(cmd, "RESTORE") == 0) {
-    /* Wipe all keys, then parse lines from args[1] */
     hm_free(&DB);
     hm_init(&DB, 1024);
     const char *data = args[1].data;
@@ -2091,6 +2141,59 @@ static void execute_command(Bulk args[], int argc) {
       }
     }
     resp_simple_string("OK");
+  } else if (strcmp(cmd, "AOF") == 0) {
+    char sub[16];
+    int sl = args[1].len;
+    if (sl > (int)sizeof(sub) - 1)
+      sl = (int)sizeof(sub) - 1;
+    memcpy(sub, args[1].data, (size_t)sl);
+    sub[sl] = '\0';
+    for (int i = 0; i < sl; i++)
+      sub[i] = (char)toupper((unsigned char)sub[i]);
+
+    if (strcmp(sub, "ON") == 0) {
+      AOF.enabled = 1;
+      resp_simple_string("OK");
+    } else if (strcmp(sub, "OFF") == 0) {
+      AOF.enabled = 0;
+      resp_simple_string("OK");
+    } else if (strcmp(sub, "CLEAR") == 0) {
+      for (int i = 0; i < AOF.count; i++)
+        free(AOF.entries[i].line);
+      free(AOF.entries);
+      AOF.entries = NULL;
+      AOF.count = AOF.cap = 0;
+      resp_simple_string("OK");
+    } else if (strcmp(sub, "DUMP") == 0) {
+      for (int i = 0; i < AOF.count; i++)
+        resp_bulk(AOF.entries[i].line, AOF.entries[i].len);
+      resp_simple_string("OK");
+    } else if (strcmp(sub, "REPLAY") == 0) {
+      hm_free(&DB);
+      hm_init(&DB, 1024);
+      for (int i = 0; i < AOF.count; i++) {
+        char *tmp = malloc((size_t)AOF.entries[i].len + 1);
+        memcpy(tmp, AOF.entries[i].line, (size_t)AOF.entries[i].len);
+        tmp[AOF.entries[i].len] = '\0';
+        Bulk rargs[MAX_ARGS];
+        int rargc = parse_text_request(tmp, rargs, MAX_ARGS);
+        if (rargc > 0) {
+          char *buf = NULL;
+          size_t sz = 0;
+          FILE *mem = open_memstream(&buf, &sz);
+          FILE *saved = g_out;
+          g_out = mem;
+          execute_command(rargs, rargc);
+          fflush(mem);
+          g_out = saved;
+          fclose(mem);
+          free(buf);
+        }
+        free(tmp);
+      }
+      resp_simple_string("OK");
+    } else
+      resp_error("ERR unknown subcommand");
   }
 }
 
@@ -2222,6 +2325,8 @@ static void handle_command(Bulk args[], int argc) {
     return;
   }
 
+  if (AOF.enabled && is_write_command(cmd))
+    aof_append(args, argc);
   execute_command(args, argc);
 }
 
@@ -2265,6 +2370,9 @@ int main(void) {
     fflush(stdout);
   }
   free_queue();
+  for (int i = 0; i < AOF.count; i++)
+    free(AOF.entries[i].line);
+  free(AOF.entries);
   reader_free(&r);
   hm_free(&DB);
   return 0;
