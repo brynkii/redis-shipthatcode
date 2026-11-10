@@ -6,6 +6,8 @@
 #include <string.h>
 
 #define MAX_ARGS 64
+#define WRONGTYPE_MSG                                                          \
+  "WRONGTYPE Operation against a key holding the wrong kind of value"
 
 typedef struct {
   char *data;
@@ -19,7 +21,7 @@ static long long virtual_now_ms = 0;
 static long long now_ms(void) { return virtual_now_ms; }
 
 /* ============================================================
- * Buffered reader over stdin (binary safe)
+ * Buffered reader
  * ============================================================ */
 typedef struct {
   unsigned char *buf;
@@ -32,13 +34,12 @@ static void reader_init(Reader *r) {
   r->len = 0;
   r->pos = 0;
   r->peeked = -1;
-  r->buf = (unsigned char *)malloc(r->cap);
+  r->buf = malloc(r->cap);
 }
 static void reader_free(Reader *r) {
   free(r->buf);
   r->buf = NULL;
 }
-
 static int reader_fill(Reader *r) {
   if (r->pos < r->len)
     return 1;
@@ -69,8 +70,8 @@ static int reader_read(Reader *r, unsigned char *out, size_t n) {
   while (got < n) {
     if (r->pos >= r->len && !reader_fill(r))
       return 0;
-    size_t avail = r->len - r->pos;
-    size_t take = (n - got < avail) ? (n - got) : avail;
+    size_t avail = r->len - r->pos,
+           take = (n - got < avail) ? (n - got) : avail;
     memcpy(out + got, r->buf + r->pos, take);
     r->pos += take;
     got += take;
@@ -79,7 +80,7 @@ static int reader_read(Reader *r, unsigned char *out, size_t n) {
 }
 static char *reader_readline(Reader *r) {
   size_t cap = 64, len = 0;
-  char *out = (char *)malloc(cap);
+  char *out = malloc(cap);
   for (;;) {
     int c = reader_getc(r);
     if (c < 0) {
@@ -93,7 +94,7 @@ static char *reader_readline(Reader *r) {
     }
     if (len + 1 >= cap) {
       cap *= 2;
-      out = (char *)realloc(out, cap);
+      out = realloc(out, cap);
     }
     out[len++] = (char)c;
   }
@@ -112,7 +113,7 @@ static int reader_consume_terminator(Reader *r) {
 }
 static char *reader_read_rawline(Reader *r) {
   size_t cap = 128, len = 0;
-  char *out = (char *)malloc(cap);
+  char *out = malloc(cap);
   for (;;) {
     int c = reader_getc(r);
     if (c < 0) {
@@ -126,7 +127,7 @@ static char *reader_read_rawline(Reader *r) {
       break;
     if (len + 1 >= cap) {
       cap *= 2;
-      out = (char *)realloc(out, cap);
+      out = realloc(out, cap);
     }
     out[len++] = (char)c;
   }
@@ -137,12 +138,13 @@ static char *reader_read_rawline(Reader *r) {
 }
 
 /* ============================================================
- * RESP array parser
+ * RESP request parsers
  * ============================================================ */
 static void free_args(Bulk args[], int argc) {
   for (int i = 0; i < argc; i++)
     free(args[i].data);
 }
+
 static int parse_resp_request(Reader *r, Bulk args[], int max_args,
                               char **errmsg) {
   int c = reader_getc(r);
@@ -194,7 +196,7 @@ static int parse_resp_request(Reader *r, Bulk args[], int max_args,
       free_args(args, argc);
       return -1;
     }
-    char *data = (char *)malloc((size_t)blen + 1);
+    char *data = malloc((size_t)blen + 1);
     if (blen > 0 && !reader_read(r, (unsigned char *)data, (size_t)blen)) {
       free(data);
       *errmsg = strdup("ERR Protocol error: truncated bulk data");
@@ -215,9 +217,6 @@ static int parse_resp_request(Reader *r, Bulk args[], int max_args,
   return argc;
 }
 
-/* ============================================================
- * Text line parser (space separated, "..." quoting)
- * ============================================================ */
 static int parse_text_request(char *line, Bulk args[], int max_args) {
   int count = 0, in_quotes = 0;
   char *start = NULL;
@@ -265,17 +264,34 @@ static void resp_bulk(const char *data, int len) {
   printf("\r\n");
 }
 static void resp_null_bulk(void) { printf("$-1\r\n"); }
+static void resp_array_header(int n) { printf("*%d\r\n", n); }
+static void resp_null_array(void) { printf("*-1\r\n"); }
 
 /* ============================================================
- * Hash map with tri-state slots (0 empty, 1 occupied, 2 tombstone)
+ * Hash map with tri-state slots + typed values
  * ============================================================ */
+typedef enum { T_STR = 1, T_LIST = 2 } ValueType;
+
+typedef struct ListNode {
+  char *data;
+  int len;
+  struct ListNode *prev, *next;
+} ListNode;
+
+typedef struct {
+  ListNode *head, *tail;
+  long len;
+} List;
+
 typedef struct {
   char *key;
   int klen;
+  int used; /* 0 empty | 1 occupied | 2 tombstone */
+  long long expire_at_ms;
+  ValueType type;
   char *val;
-  int vlen;
-  int used;               /* 0 empty | 1 occupied | 2 tombstone */
-  long long expire_at_ms; /* 0 = no expiry */
+  int vlen;  /* T_STR */
+  List list; /* T_LIST */
 } Slot;
 
 typedef struct {
@@ -293,26 +309,51 @@ static uint64_t fnv1a(const void *data, size_t len) {
   return h;
 }
 
+static void list_free(List *l) {
+  ListNode *n = l->head;
+  while (n) {
+    ListNode *next = n->next;
+    free(n->data);
+    free(n);
+    n = next;
+  }
+  l->head = l->tail = NULL;
+  l->len = 0;
+}
+
+static void slot_clear(Slot *s) {
+  free(s->key);
+  s->key = NULL;
+  s->klen = 0;
+  if (s->type == T_LIST) {
+    list_free(&s->list);
+  } else {
+    free(s->val);
+    s->val = NULL;
+    s->vlen = 0;
+  }
+  s->expire_at_ms = 0;
+  s->type = T_STR;
+  s->used = 2; /* tombstone */
+}
+
 static void hm_init(HashMap *m, size_t cap) {
   size_t c = 8;
   while (c < cap)
     c <<= 1;
   m->cap = c;
   m->count = 0;
-  m->slots = (Slot *)calloc(c, sizeof(Slot));
+  m->slots = calloc(c, sizeof(Slot));
 }
 static void hm_free(HashMap *m) {
   for (size_t i = 0; i < m->cap; i++)
-    if (m->slots[i].used == 1) {
-      free(m->slots[i].key);
-      free(m->slots[i].val);
-    }
+    if (m->slots[i].used == 1)
+      slot_clear(&m->slots[i]);
   free(m->slots);
   m->slots = NULL;
   m->cap = m->count = 0;
 }
 
-/* Find matching slot, or insertion index (first tombstone if any). */
 static size_t hm_find_slot(const HashMap *m, const char *key, int klen) {
   uint64_t h = fnv1a(key, (size_t)klen);
   size_t mask = m->cap - 1, i = (size_t)h & mask;
@@ -332,7 +373,7 @@ static void hm_grow(HashMap *m) {
   size_t newcap = m->cap * 2;
   Slot *old = m->slots;
   size_t oldcap = m->cap;
-  m->slots = (Slot *)calloc(newcap, sizeof(Slot));
+  m->slots = calloc(newcap, sizeof(Slot));
   m->cap = newcap;
   m->count = 0;
   for (size_t i = 0; i < oldcap; i++)
@@ -349,57 +390,77 @@ static Slot *hm_get(HashMap *m, const char *key, int klen) {
   return (m->slots[i].used == 1) ? &m->slots[i] : NULL;
 }
 
-static void hm_set_ttl(HashMap *m, const char *key, int klen, const char *val,
+/* Insert or overwrite a string value. */
+static void hm_set_str(HashMap *m, const char *key, int klen, const char *val,
                        int vlen, long long expire_at_ms) {
   if ((m->count + 1) * 10 >= m->cap * 7)
     hm_grow(m);
   size_t i = hm_find_slot(m, key, klen);
   if (m->slots[i].used == 1) {
-    free(m->slots[i].val);
-    m->slots[i].val = (char *)malloc((size_t)vlen);
+    if (m->slots[i].type == T_LIST)
+      list_free(&m->slots[i].list);
+    else
+      free(m->slots[i].val);
+    m->slots[i].type = T_STR;
+    m->slots[i].val = malloc((size_t)vlen);
     memcpy(m->slots[i].val, val, (size_t)vlen);
     m->slots[i].vlen = vlen;
     m->slots[i].expire_at_ms = expire_at_ms;
     return;
   }
-  /* empty or tombstone: fresh insert */
   m->slots[i].used = 1;
-  m->slots[i].key = (char *)malloc((size_t)klen);
+  m->slots[i].key = malloc((size_t)klen);
   memcpy(m->slots[i].key, key, (size_t)klen);
   m->slots[i].klen = klen;
-  m->slots[i].val = (char *)malloc((size_t)vlen);
+  m->slots[i].type = T_STR;
+  m->slots[i].val = malloc((size_t)vlen);
   memcpy(m->slots[i].val, val, (size_t)vlen);
   m->slots[i].vlen = vlen;
   m->slots[i].expire_at_ms = expire_at_ms;
+  m->slots[i].list.head = m->slots[i].list.tail = NULL;
+  m->slots[i].list.len = 0;
   m->count++;
 }
 
-static void hm_set(HashMap *m, const char *key, int klen, const char *val,
-                   int vlen) {
-  hm_set_ttl(m, key, klen, val, vlen, 0);
+/* Insert a fresh list (used by LPUSH/RPUSH when key doesn't exist). */
+static void hm_set_list(HashMap *m, const char *key, int klen,
+                        long long expire_at_ms) {
+  if ((m->count + 1) * 10 >= m->cap * 7)
+    hm_grow(m);
+  size_t i = hm_find_slot(m, key, klen);
+  if (m->slots[i].used == 1) {
+    /* caller already verified type is LIST */
+    m->slots[i].expire_at_ms = expire_at_ms;
+    return;
+  }
+  m->slots[i].used = 1;
+  m->slots[i].key = malloc((size_t)klen);
+  memcpy(m->slots[i].key, key, (size_t)klen);
+  m->slots[i].klen = klen;
+  m->slots[i].type = T_LIST;
+  m->slots[i].val = NULL;
+  m->slots[i].vlen = 0;
+  m->slots[i].expire_at_ms = expire_at_ms;
+  m->slots[i].list.head = m->slots[i].list.tail = NULL;
+  m->slots[i].list.len = 0;
+  m->count++;
 }
 
 static HashMap DB;
 
+/* Reap expired slot; returns 1 if removed. */
 static int expire_if_needed_impl(const char *key, int klen) {
   Slot *s = hm_get(&DB, key, klen);
   if (!s)
     return 0;
   if (s->expire_at_ms != 0 && now_ms() >= s->expire_at_ms) {
-    free(s->key);
-    free(s->val);
-    s->key = NULL;
-    s->val = NULL;
-    s->klen = s->vlen = 0;
-    s->expire_at_ms = 0;
-    s->used = 2; /* tombstone */
+    slot_clear(s);
     DB.count--;
     return 1;
   }
   return 0;
 }
 
-/* Live count for DBSIZE: occupied slots whose TTL hasn't lapsed. */
 static long hm_live_count(HashMap *m) {
   long n = 0;
   for (size_t i = 0; i < m->cap; i++)
@@ -407,6 +468,38 @@ static long hm_live_count(HashMap *m) {
         (m->slots[i].expire_at_ms == 0 || now_ms() < m->slots[i].expire_at_ms))
       n++;
   return n;
+}
+
+/* ============================================================
+ * List operations
+ * ============================================================ */
+static ListNode *list_node_new(const char *data, int len) {
+  ListNode *n = malloc(sizeof *n);
+  n->data = malloc((size_t)len);
+  memcpy(n->data, data, (size_t)len);
+  n->len = len;
+  n->prev = n->next = NULL;
+  return n;
+}
+static void list_push_head(List *l, const char *data, int len) {
+  ListNode *n = list_node_new(data, len);
+  n->next = l->head;
+  if (l->head)
+    l->head->prev = n;
+  else
+    l->tail = n;
+  l->head = n;
+  l->len++;
+}
+static void list_push_tail(List *l, const char *data, int len) {
+  ListNode *n = list_node_new(data, len);
+  n->prev = l->tail;
+  if (l->tail)
+    l->tail->next = n;
+  else
+    l->head = n;
+  l->tail = n;
+  l->len++;
 }
 
 /* ============================================================
@@ -442,6 +535,10 @@ static void do_incr_by(Bulk args[], int key_idx, long long delta) {
   long long current = 0;
   Slot *s = hm_get(&DB, key->data, key->len);
   if (s) {
+    if (s->type != T_STR) {
+      resp_error(WRONGTYPE_MSG);
+      return;
+    }
     if (!parse_ll_strict(s->val, s->vlen, &current)) {
       resp_error("ERR value is not an integer or out of range");
       return;
@@ -455,7 +552,7 @@ static void do_incr_by(Bulk args[], int key_idx, long long delta) {
   long long n = current + delta;
   char buf[32];
   int blen = snprintf(buf, sizeof(buf), "%lld", n);
-  hm_set(&DB, key->data, key->len, buf, blen);
+  hm_set_str(&DB, key->data, key->len, buf, blen, 0);
   resp_integer(n);
 }
 
@@ -469,16 +566,19 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1},   {"ECHO", 1, 1},    {"SET", 2, 6},    {"GET", 1, 1},
-    {"EXISTS", 1, 1}, {"DBSIZE", 0, 0},  {"INCR", 1, 1},   {"DECR", 1, 1},
-    {"INCRBY", 2, 2}, {"DECRBY", 2, 2},  {"EXPIRE", 2, 2}, {"TTL", 1, 1},
+    {"PING", 0, 1},   {"ECHO", 1, 1},    {"SET", 2, 6},
+    {"GET", 1, 1},    {"EXISTS", 1, 1},  {"DBSIZE", 0, 0},
+    {"INCR", 1, 1},   {"DECR", 1, 1},    {"INCRBY", 2, 2},
+    {"DECRBY", 2, 2}, {"EXPIRE", 2, 2},  {"TTL", 1, 1},
     {"PTTL", 1, 1},   {"PERSIST", 1, 1}, {"WAIT", 1, 1},
+    {"LPUSH", 2, -1},                   /* key value [value ...] */
+    {"RPUSH", 2, -1}, {"LRANGE", 3, 3}, /* key start stop */
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
-static const CommandSpec *lookup_command(const char *upper_cmd) {
+static const CommandSpec *lookup_command(const char *u) {
   for (int i = 0; i < NUM_COMMANDS; i++)
-    if (strcmp(COMMANDS[i].name, upper_cmd) == 0)
+    if (strcmp(COMMANDS[i].name, u) == 0)
       return &COMMANDS[i];
   return NULL;
 }
@@ -531,7 +631,6 @@ static void handle_command(Bulk args[], int argc) {
   } else if (strcmp(cmd, "SET") == 0) {
     int nx = 0, xx = 0, have_ex = 0, have_px = 0, bad_flag = 0, non_int = 0;
     long long ttl_ms = 0;
-
     for (int i = 3; i < argc; i++) {
       char f[16];
       int flen = args[i].len;
@@ -543,7 +642,6 @@ static void handle_command(Bulk args[], int argc) {
       f[flen] = '\0';
       for (int k = 0; k < flen; k++)
         f[k] = (char)toupper((unsigned char)f[k]);
-
       if (strcmp(f, "NX") == 0)
         nx = 1;
       else if (strcmp(f, "XX") == 0)
@@ -571,21 +669,23 @@ static void handle_command(Bulk args[], int argc) {
         break;
       }
     }
-
-    if (non_int) {
+    if (non_int)
       resp_error("ERR value is not an integer or out of range");
-    } else if (bad_flag || (nx && xx) || (have_ex && have_px)) {
+    else if (bad_flag || (nx && xx) || (have_ex && have_px))
       resp_error("ERR syntax error");
-    } else {
-      /* lazy-expire before NX/XX sees the key */
+    else {
       expire_if_needed_impl(args[1].data, args[1].len);
       Slot *s = hm_get(&DB, args[1].data, args[1].len);
       int exists = (s != NULL);
-      if ((nx && exists) || (xx && !exists)) {
+      if (nx && exists)
         resp_null_bulk();
-      } else {
+      else if (xx && !exists)
+        resp_null_bulk();
+      else if (s && s->type != T_STR)
+        resp_error(WRONGTYPE_MSG);
+      else {
         long long deadline = (ttl_ms > 0) ? now_ms() + ttl_ms : 0;
-        hm_set_ttl(&DB, args[1].data, args[1].len, args[2].data, args[2].len,
+        hm_set_str(&DB, args[1].data, args[1].len, args[2].data, args[2].len,
                    deadline);
         resp_simple_string("OK");
       }
@@ -593,34 +693,36 @@ static void handle_command(Bulk args[], int argc) {
   } else if (strcmp(cmd, "GET") == 0) {
     expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
-    if (s)
-      resp_bulk(s->val, s->vlen);
-    else
+    if (!s)
       resp_null_bulk();
+    else if (s->type != T_STR)
+      resp_error(WRONGTYPE_MSG);
+    else
+      resp_bulk(s->val, s->vlen);
   } else if (strcmp(cmd, "EXISTS") == 0) {
     expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
     resp_integer(s ? 1 : 0);
   } else if (strcmp(cmd, "DBSIZE") == 0) {
     resp_integer(hm_live_count(&DB));
-  } else if (strcmp(cmd, "INCR") == 0) {
+  } else if (strcmp(cmd, "INCR") == 0)
     do_incr_by(args, 1, 1);
-  } else if (strcmp(cmd, "DECR") == 0) {
+  else if (strcmp(cmd, "DECR") == 0)
     do_incr_by(args, 1, -1);
-  } else if (strcmp(cmd, "INCRBY") == 0) {
-    long long delta;
-    if (!parse_ll_strict(args[2].data, args[2].len, &delta))
+  else if (strcmp(cmd, "INCRBY") == 0) {
+    long long d;
+    if (!parse_ll_strict(args[2].data, args[2].len, &d))
       resp_error("ERR value is not an integer or out of range");
     else
-      do_incr_by(args, 1, delta);
+      do_incr_by(args, 1, d);
   } else if (strcmp(cmd, "DECRBY") == 0) {
-    long long delta;
-    if (!parse_ll_strict(args[2].data, args[2].len, &delta))
+    long long d;
+    if (!parse_ll_strict(args[2].data, args[2].len, &d))
       resp_error("ERR value is not an integer or out of range");
-    else if (delta == LLONG_MIN)
+    else if (d == LLONG_MIN)
       resp_error("ERR increment or decrement would overflow");
     else
-      do_incr_by(args, 1, -delta);
+      do_incr_by(args, 1, -d);
   } else if (strcmp(cmd, "EXPIRE") == 0) {
     long long secs;
     if (!parse_ll_strict(args[2].data, args[2].len, &secs)) {
@@ -631,14 +733,7 @@ static void handle_command(Bulk args[], int argc) {
       if (!s)
         resp_integer(0);
       else if (secs <= 0) {
-        /* immediate delete = physical tombstone */
-        free(s->key);
-        free(s->val);
-        s->key = NULL;
-        s->val = NULL;
-        s->klen = s->vlen = 0;
-        s->expire_at_ms = 0;
-        s->used = 2;
+        slot_clear(s);
         DB.count--;
         resp_integer(1);
       } else {
@@ -646,7 +741,8 @@ static void handle_command(Bulk args[], int argc) {
         resp_integer(1);
       }
     }
-  } else if (strcmp(cmd, "TTL") == 0) {
+  } else if (strcmp(cmd, "TTL") == 0 || strcmp(cmd, "PTTL") == 0) {
+    int is_pttl = (cmd[0] == 'P');
     expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
     if (!s)
@@ -658,21 +754,7 @@ static void handle_command(Bulk args[], int argc) {
       if (rem <= 0)
         resp_integer(-2);
       else
-        resp_integer((rem + 500) / 1000);
-    }
-  } else if (strcmp(cmd, "PTTL") == 0) {
-    expire_if_needed_impl(args[1].data, args[1].len);
-    Slot *s = hm_get(&DB, args[1].data, args[1].len);
-    if (!s)
-      resp_integer(-2);
-    else if (s->expire_at_ms == 0)
-      resp_integer(-1);
-    else {
-      long long rem = s->expire_at_ms - now_ms();
-      if (rem <= 0)
-        resp_integer(-2);
-      else
-        resp_integer(rem);
+        resp_integer(is_pttl ? rem : (rem + 500) / 1000);
     }
   } else if (strcmp(cmd, "PERSIST") == 0) {
     expire_if_needed_impl(args[1].data, args[1].len);
@@ -691,6 +773,61 @@ static void handle_command(Bulk args[], int argc) {
       virtual_now_ms += ms;
       resp_simple_string("OK");
     }
+  } else if (strcmp(cmd, "LPUSH") == 0 || strcmp(cmd, "RPUSH") == 0) {
+    int is_lpush = (cmd[0] == 'L');
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (s && s->type != T_LIST) {
+      resp_error(WRONGTYPE_MSG);
+    } else {
+      if (!s) {
+        hm_set_list(&DB, args[1].data, args[1].len, 0);
+        s = hm_get(&DB, args[1].data, args[1].len);
+      }
+      for (int i = 2; i < argc; i++) {
+        if (is_lpush)
+          list_push_head(&s->list, args[i].data, args[i].len);
+        else
+          list_push_tail(&s->list, args[i].data, args[i].len);
+      }
+      resp_integer(s->list.len);
+    }
+  } else if (strcmp(cmd, "LRANGE") == 0) {
+    long long start, stop;
+    if (!parse_ll_strict(args[2].data, args[2].len, &start) ||
+        !parse_ll_strict(args[3].data, args[3].len, &stop)) {
+      resp_error("ERR value is not an integer or out of range");
+    } else {
+      expire_if_needed_impl(args[1].data, args[1].len);
+      Slot *s = hm_get(&DB, args[1].data, args[1].len);
+      if (!s) {
+        resp_array_header(0);
+      } else if (s->type != T_LIST)
+        resp_error(WRONGTYPE_MSG);
+      else {
+        long n = s->list.len;
+        if (start < 0)
+          start += n;
+        if (stop < 0)
+          stop += n;
+        if (start < 0)
+          start = 0;
+        if (stop >= n)
+          stop = n - 1;
+        if (start > stop || start >= n) {
+          resp_array_header(0);
+        } else {
+          resp_array_header((int)(stop - start + 1));
+          ListNode *cur = s->list.head;
+          for (long i = 0; i < start && cur; i++)
+            cur = cur->next;
+          for (long i = start; i <= stop && cur; i++) {
+            resp_bulk(cur->data, cur->len);
+            cur = cur->next;
+          }
+        }
+      }
+    }
   }
   fflush(stdout);
 }
@@ -703,7 +840,6 @@ int main(void) {
   Reader r;
   reader_init(&r);
   Bulk args[MAX_ARGS];
-
   for (;;) {
     int first = reader_peekc(&r);
     if (first < 0)
