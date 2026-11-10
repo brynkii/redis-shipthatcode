@@ -219,10 +219,6 @@ static int parse_resp_request(Reader *r, Bulk args[], int max_args,
 
 /* ============================================================
  * Text line parser (space separated, "..." quoting)
- *
- * RESTORED to the simple, known-working version: no in-place
- * unescaping. Splits on unquoted spaces; strips quotes; quoted
- * spans (including empty "") become one argument.
  * ============================================================ */
 
 static int parse_text_request(char *line, Bulk args[], int max_args) {
@@ -372,7 +368,6 @@ static void hm_set(HashMap *m, const char *key, int klen, const char *val,
   m->count++;
 }
 
-/* LIVE key count. TTL lesson will change this to skip lapsed keys. */
 static long hm_live_count(const HashMap *m) { return (long)m->count; }
 
 static HashMap DB;
@@ -388,7 +383,8 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1}, {"ECHO", 1, 1},   {"SET", 2, 2},
+    {"PING", 0, 1}, {"ECHO", 1, 1},
+    {"SET", 2, 4}, /* key value [NX|XX] [NX|XX] — validated in handler */
     {"GET", 1, 1},  {"DBSIZE", 0, 0},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
@@ -447,8 +443,42 @@ static void handle_command(Bulk args[], int argc) {
   } else if (strcmp(cmd, "ECHO") == 0) {
     resp_bulk(args[1].data, args[1].len);
   } else if (strcmp(cmd, "SET") == 0) {
-    hm_set(&DB, args[1].data, args[1].len, args[2].data, args[2].len);
-    resp_simple_string("OK");
+    /* Generic flag loop over args[3..argc-1] */
+    int nx = 0, xx = 0, bad_flag = 0;
+
+    for (int i = 3; i < argc; i++) {
+      char f[16];
+      int flen = args[i].len;
+      if (flen > (int)sizeof(f) - 1) {
+        bad_flag = 1;
+        break;
+      }
+      memcpy(f, args[i].data, (size_t)flen);
+      f[flen] = '\0';
+      for (int k = 0; k < flen; k++)
+        f[k] = (char)toupper((unsigned char)f[k]);
+
+      if (strcmp(f, "NX") == 0)
+        nx = 1;
+      else if (strcmp(f, "XX") == 0)
+        xx = 1;
+      else {
+        bad_flag = 1;
+        break;
+      }
+    }
+
+    if (bad_flag || (nx && xx)) {
+      resp_error("ERR syntax error");
+    } else {
+      int exists = (hm_get(&DB, args[1].data, args[1].len) != NULL);
+      if ((nx && exists) || (xx && !exists)) {
+        resp_null_bulk();
+      } else {
+        hm_set(&DB, args[1].data, args[1].len, args[2].data, args[2].len);
+        resp_simple_string("OK");
+      }
+    }
   } else if (strcmp(cmd, "GET") == 0) {
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
     if (s)
@@ -498,7 +528,7 @@ int main(void) {
         if (argc > 0)
           handle_command(args, argc);
       }
-      free(line); /* args[i].data alias into `line`; do NOT free_args */
+      free(line);
     }
   }
 
