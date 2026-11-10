@@ -273,6 +273,19 @@ static void encode_array(const char **items, const int *lens, int count) {
 }
 
 /* ============================================================
+ * Common FNV-1a
+ * ============================================================ */
+static uint64_t fnv1a(const void *data, size_t len) {
+  const unsigned char *p = (const unsigned char *)data;
+  uint64_t h = 1469598103934665603ULL;
+  for (size_t i = 0; i < len; i++) {
+    h ^= p[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+/* ============================================================
  * Hash (inner) — open addressing with tombstones + insertion seq
  * ============================================================ */
 static uint64_t hash_seq_counter = 0;
@@ -290,8 +303,6 @@ typedef struct {
   HashField *entries;
   size_t cap, count;
 } Hash;
-
-static uint64_t fnv1a(const void *data, size_t len);
 
 static void hash_init(Hash *h) {
   h->cap = 8;
@@ -345,7 +356,6 @@ static HashField *hash_get(Hash *h, const char *field, int flen) {
   return (h->entries[i].used == 1) ? &h->entries[i] : NULL;
 }
 
-/* Returns 1 if newly created, 0 if overwritten. */
 static int hash_set(Hash *h, const char *field, int flen, const char *value,
                     int vlen) {
   if ((h->count + 1) * 10 >= h->cap * 7)
@@ -370,7 +380,6 @@ static int hash_set(Hash *h, const char *field, int flen, const char *value,
   return 1;
 }
 
-/* Returns 1 if field existed and was removed, 0 otherwise. */
 static int hash_del(Hash *h, const char *field, int flen) {
   size_t i = hash_find_slot(h, field, flen);
   if (h->entries[i].used != 1)
@@ -386,7 +395,6 @@ static int hash_del(Hash *h, const char *field, int flen) {
   return 1;
 }
 
-/* qsort comparator: insertion order (ascending seq). */
 static int cmp_seq(const void *a, const void *b) {
   const HashField *fa = *(const HashField *const *)a;
   const HashField *fb = *(const HashField *const *)b;
@@ -398,9 +406,99 @@ static int cmp_seq(const void *a, const void *b) {
 }
 
 /* ============================================================
+ * Set (inner) — open addressing with tombstones, no ordering
+ * ============================================================ */
+typedef struct SetMember {
+  char *data;
+  int len;
+  int used;
+} SetMember;
+
+typedef struct {
+  SetMember *entries;
+  size_t cap, count;
+} Set;
+
+static void set_init(Set *s) {
+  s->cap = 8;
+  s->count = 0;
+  s->entries = calloc(s->cap, sizeof(SetMember));
+}
+static void set_free(Set *s) {
+  for (size_t i = 0; i < s->cap; i++)
+    if (s->entries[i].used == 1)
+      free(s->entries[i].data);
+  free(s->entries);
+  s->entries = NULL;
+  s->cap = s->count = 0;
+}
+
+static size_t set_find_slot(const Set *s, const char *data, int len) {
+  uint64_t hv = fnv1a(data, (size_t)len);
+  size_t mask = s->cap - 1, i = (size_t)hv & mask;
+  size_t first_tomb = (size_t)-1;
+  while (s->entries[i].used != 0) {
+    if (s->entries[i].used == 1 && s->entries[i].len == len &&
+        memcmp(s->entries[i].data, data, (size_t)len) == 0)
+      return i;
+    if (s->entries[i].used == 2 && first_tomb == (size_t)-1)
+      first_tomb = i;
+    i = (i + 1) & mask;
+  }
+  return (first_tomb != (size_t)-1) ? first_tomb : i;
+}
+
+static void set_grow(Set *s) {
+  size_t newcap = s->cap * 2;
+  SetMember *old = s->entries;
+  size_t oldcap = s->cap;
+  s->entries = calloc(newcap, sizeof(SetMember));
+  s->cap = newcap;
+  s->count = 0;
+  for (size_t i = 0; i < oldcap; i++)
+    if (old[i].used == 1) {
+      size_t j = set_find_slot(s, old[i].data, old[i].len);
+      s->entries[j] = old[i];
+      s->count++;
+    }
+  free(old);
+}
+
+static SetMember *set_get(Set *s, const char *data, int len) {
+  size_t i = set_find_slot(s, data, len);
+  return (s->entries[i].used == 1) ? &s->entries[i] : NULL;
+}
+
+static int set_add(Set *s, const char *data, int len) {
+  if ((s->count + 1) * 10 >= s->cap * 7)
+    set_grow(s);
+  size_t i = set_find_slot(s, data, len);
+  if (s->entries[i].used == 1)
+    return 0;
+  s->entries[i].used = 1;
+  s->entries[i].data = malloc((size_t)len);
+  memcpy(s->entries[i].data, data, (size_t)len);
+  s->entries[i].len = len;
+  s->count++;
+  return 1;
+}
+
+static int set_remove(Set *s, const char *data, int len) {
+  size_t i = set_find_slot(s, data, len);
+  if (s->entries[i].used != 1)
+    return 0;
+  free(s->entries[i].data);
+  s->entries[i].data = NULL;
+  s->entries[i].len = 0;
+  s->entries[i].used = 2;
+  s->count--;
+  return 1;
+}
+
+/* ============================================================
  * Top-level store
  * ============================================================ */
-typedef enum { T_STR = 1, T_LIST = 2, T_HASH = 3 } ValueType;
+typedef enum { T_STR = 1, T_LIST = 2, T_HASH = 3, T_SET = 4 } ValueType;
 
 typedef struct ListNode {
   char *data;
@@ -423,22 +521,13 @@ typedef struct {
   int vlen;
   List list;
   Hash hash;
+  Set set;
 } Slot;
 
 typedef struct {
   Slot *slots;
   size_t cap, count;
 } HashMap;
-
-static uint64_t fnv1a(const void *data, size_t len) {
-  const unsigned char *p = (const unsigned char *)data;
-  uint64_t h = 1469598103934665603ULL;
-  for (size_t i = 0; i < len; i++) {
-    h ^= p[i];
-    h *= 1099511628211ULL;
-  }
-  return h;
-}
 
 static void list_free(List *l) {
   ListNode *n = l->head;
@@ -460,6 +549,8 @@ static void slot_clear(Slot *s) {
     list_free(&s->list);
   else if (s->type == T_HASH)
     hash_free(&s->hash);
+  else if (s->type == T_SET)
+    set_free(&s->set);
   else {
     free(s->val);
     s->val = NULL;
@@ -533,6 +624,8 @@ static void hm_set_str(HashMap *m, const char *key, int klen, const char *val,
       list_free(&m->slots[i].list);
     else if (m->slots[i].type == T_HASH)
       hash_free(&m->slots[i].hash);
+    else if (m->slots[i].type == T_SET)
+      set_free(&m->slots[i].set);
     else
       free(m->slots[i].val);
     m->slots[i].type = T_STR;
@@ -598,6 +691,29 @@ static void hm_set_hash(HashMap *m, const char *key, int klen,
   m->slots[i].list.head = m->slots[i].list.tail = NULL;
   m->slots[i].list.len = 0;
   hash_init(&m->slots[i].hash);
+  m->count++;
+}
+
+static void hm_set_set(HashMap *m, const char *key, int klen,
+                       long long expire_at_ms) {
+  if ((m->count + 1) * 10 >= m->cap * 7)
+    hm_grow(m);
+  size_t i = hm_find_slot(m, key, klen);
+  if (m->slots[i].used == 1) {
+    m->slots[i].expire_at_ms = expire_at_ms;
+    return;
+  }
+  m->slots[i].used = 1;
+  m->slots[i].key = malloc((size_t)klen);
+  memcpy(m->slots[i].key, key, (size_t)klen);
+  m->slots[i].klen = klen;
+  m->slots[i].type = T_SET;
+  m->slots[i].val = NULL;
+  m->slots[i].vlen = 0;
+  m->slots[i].expire_at_ms = expire_at_ms;
+  m->slots[i].list.head = m->slots[i].list.tail = NULL;
+  m->slots[i].list.len = 0;
+  set_init(&m->slots[i].set);
   m->count++;
 }
 
@@ -750,13 +866,14 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1},    {"ECHO", 1, 1},    {"SET", 2, 6},    {"GET", 1, 1},
-    {"EXISTS", 1, 1},  {"DBSIZE", 0, 0},  {"INCR", 1, 1},   {"DECR", 1, 1},
-    {"INCRBY", 2, 2},  {"DECRBY", 2, 2},  {"EXPIRE", 2, 2}, {"TTL", 1, 1},
-    {"PTTL", 1, 1},    {"PERSIST", 1, 1}, {"WAIT", 1, 1},   {"LPUSH", 2, -1},
-    {"RPUSH", 2, -1},  {"LRANGE", 3, 3},  {"LPOP", 1, 1},   {"RPOP", 1, 1},
-    {"LLEN", 1, 1},    {"HSET", 3, -1},   {"HGET", 2, 2},   {"HDEL", 2, -1},
-    {"HGETALL", 1, 1}, {"HEXISTS", 2, 2}, {"HLEN", 1, 1},
+    {"PING", 0, 1},     {"ECHO", 1, 1},      {"SET", 2, 6},    {"GET", 1, 1},
+    {"EXISTS", 1, 1},   {"DBSIZE", 0, 0},    {"INCR", 1, 1},   {"DECR", 1, 1},
+    {"INCRBY", 2, 2},   {"DECRBY", 2, 2},    {"EXPIRE", 2, 2}, {"TTL", 1, 1},
+    {"PTTL", 1, 1},     {"PERSIST", 1, 1},   {"WAIT", 1, 1},   {"LPUSH", 2, -1},
+    {"RPUSH", 2, -1},   {"LRANGE", 3, 3},    {"LPOP", 1, 1},   {"RPOP", 1, 1},
+    {"LLEN", 1, 1},     {"HSET", 3, -1},     {"HGET", 2, 2},   {"HDEL", 2, -1},
+    {"HGETALL", 1, 1},  {"HEXISTS", 2, 2},   {"HLEN", 1, 1},   {"SADD", 2, -1},
+    {"SMEMBERS", 1, 1}, {"SISMEMBER", 2, 2}, {"SCARD", 1, 1},  {"SREM", 2, -1},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -1056,9 +1173,9 @@ static void handle_command(Bulk args[], int argc) {
     } else {
       expire_if_needed_impl(args[1].data, args[1].len);
       Slot *s = hm_get(&DB, args[1].data, args[1].len);
-      if (s && s->type != T_HASH) {
+      if (s && s->type != T_HASH)
         resp_error(WRONGTYPE_MSG);
-      } else {
+      else {
         if (!s) {
           hm_set_hash(&DB, args[1].data, args[1].len, 0);
           s = hm_get(&DB, args[1].data, args[1].len);
@@ -1110,17 +1227,15 @@ static void handle_command(Bulk args[], int argc) {
       resp_error(WRONGTYPE_MSG);
     else {
       int live = (int)s->hash.count;
-      if (live == 0) {
+      if (live == 0)
         resp_array_header(0);
-      } else {
-        /* collect live fields, sort by insertion seq, flatten */
+      else {
         HashField **fields = malloc(sizeof(HashField *) * (size_t)live);
         int k = 0;
         for (size_t i = 0; i < s->hash.cap; i++)
           if (s->hash.entries[i].used == 1)
             fields[k++] = &s->hash.entries[i];
         qsort(fields, (size_t)live, sizeof(HashField *), cmp_seq);
-
         resp_array_header(live * 2);
         for (int i = 0; i < live; i++) {
           resp_bulk(fields[i]->field, fields[i]->flen);
@@ -1147,6 +1262,82 @@ static void handle_command(Bulk args[], int argc) {
       resp_error(WRONGTYPE_MSG);
     else
       resp_integer((long long)s->hash.count);
+  } else if (strcmp(cmd, "SADD") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (s && s->type != T_SET)
+      resp_error(WRONGTYPE_MSG);
+    else {
+      if (!s) {
+        hm_set_set(&DB, args[1].data, args[1].len, 0);
+        s = hm_get(&DB, args[1].data, args[1].len);
+      }
+      int added = 0;
+      for (int i = 2; i < argc; i++)
+        added += set_add(&s->set, args[i].data, args[i].len);
+      resp_integer(added);
+    }
+  } else if (strcmp(cmd, "SMEMBERS") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s)
+      resp_array_header(0);
+    else if (s->type != T_SET)
+      resp_error(WRONGTYPE_MSG);
+    else {
+      int n = (int)s->set.count;
+      if (n == 0) {
+        resp_array_header(0);
+      } else {
+        const char **items = malloc(sizeof(char *) * (size_t)n);
+        int *lens = malloc(sizeof(int) * (size_t)n);
+        int k = 0;
+        for (size_t i = 0; i < s->set.cap; i++)
+          if (s->set.entries[i].used == 1) {
+            items[k] = s->set.entries[i].data;
+            lens[k] = s->set.entries[i].len;
+            k++;
+          }
+        encode_array(items, lens, n);
+        free(items);
+        free(lens);
+      }
+    }
+  } else if (strcmp(cmd, "SISMEMBER") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s)
+      resp_integer(0);
+    else if (s->type != T_SET)
+      resp_error(WRONGTYPE_MSG);
+    else
+      resp_integer(set_get(&s->set, args[2].data, args[2].len) ? 1 : 0);
+  } else if (strcmp(cmd, "SCARD") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s)
+      resp_integer(0);
+    else if (s->type != T_SET)
+      resp_error(WRONGTYPE_MSG);
+    else
+      resp_integer((long long)s->set.count);
+  } else if (strcmp(cmd, "SREM") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s)
+      resp_integer(0);
+    else if (s->type != T_SET)
+      resp_error(WRONGTYPE_MSG);
+    else {
+      int removed = 0;
+      for (int i = 2; i < argc; i++)
+        removed += set_remove(&s->set, args[i].data, args[i].len);
+      if (s->set.count == 0) {
+        slot_clear(s);
+        DB.count--;
+      }
+      resp_integer(removed);
+    }
   }
   fflush(stdout);
 }
