@@ -5,7 +5,6 @@
 #include <string.h>
 
 #define MAX_ARGS 64
-#define MAX_LINE 4096
 
 typedef struct {
   char *data;
@@ -19,7 +18,7 @@ typedef struct {
 typedef struct {
   unsigned char *buf;
   size_t cap, len, pos;
-  int peeked; /* -1 = no peek, else the peeked byte */
+  int peeked;
 } Reader;
 
 static void reader_init(Reader *r) {
@@ -56,7 +55,7 @@ static int reader_peekc(Reader *r) {
     return r->peeked;
   if (r->pos >= r->len && !reader_fill(r))
     return -1;
-  r->peeked = r->buf[r->pos++]; /* consume so next getc returns it */
+  r->peeked = r->buf[r->pos++];
   return r->peeked;
 }
 static int reader_read(Reader *r, unsigned char *out, size_t n) {
@@ -73,7 +72,6 @@ static int reader_read(Reader *r, unsigned char *out, size_t n) {
   return 1;
 }
 
-/* Read a line terminated by CRLF or LF; strip terminator; NUL-terminate. */
 static char *reader_readline(Reader *r) {
   size_t cap = 64, len = 0;
   char *out = (char *)malloc(cap);
@@ -109,8 +107,34 @@ static int reader_consume_terminator(Reader *r) {
   return 0;
 }
 
+static char *reader_read_rawline(Reader *r) {
+  size_t cap = 128, len = 0;
+  char *out = (char *)malloc(cap);
+  for (;;) {
+    int c = reader_getc(r);
+    if (c < 0) {
+      if (len == 0) {
+        free(out);
+        return NULL;
+      }
+      break;
+    }
+    if (c == '\n')
+      break;
+    if (len + 1 >= cap) {
+      cap *= 2;
+      out = (char *)realloc(out, cap);
+    }
+    out[len++] = (char)c;
+  }
+  if (len > 0 && out[len - 1] == '\r')
+    len--;
+  out[len] = '\0';
+  return out;
+}
+
 /* ============================================================
- * RESP array request parser (step 05 format)
+ * RESP array request parser (binary safe)
  * ============================================================ */
 
 static void free_args(Bulk args[], int argc) {
@@ -194,8 +218,11 @@ static int parse_resp_request(Reader *r, Bulk args[], int max_args,
 }
 
 /* ============================================================
- * Text line parser (step 01–04 format)
- * Splits on spaces with "..." quoting, strips CRLF.
+ * Text line parser (space separated, "..." quoting)
+ *
+ * RESTORED to the simple, known-working version: no in-place
+ * unescaping. Splits on unquoted spaces; strips quotes; quoted
+ * spans (including empty "") become one argument.
  * ============================================================ */
 
 static int parse_text_request(char *line, Bulk args[], int max_args) {
@@ -234,42 +261,13 @@ static int parse_text_request(char *line, Bulk args[], int max_args) {
   return count;
 }
 
-/* Read one full text line into a malloc'd, NUL-terminated buffer. */
-static char *reader_read_rawline(Reader *r) {
-  size_t cap = 128, len = 0;
-  char *out = (char *)malloc(cap);
-  for (;;) {
-    int c = reader_getc(r);
-    if (c < 0) {
-      if (len == 0) {
-        free(out);
-        return NULL;
-      }
-      break;
-    }
-    if (c == '\n')
-      break;
-    if (len + 1 >= cap) {
-      cap *= 2;
-      out = (char *)realloc(out, cap);
-    }
-    out[len++] = (char)c;
-  }
-  if (len > 0 && out[len - 1] == '\r')
-    len--;
-  out[len] = '\0';
-  return out;
-}
-
 /* ============================================================
  * RESP response serialization
  * ============================================================ */
 
 static void resp_simple_string(const char *s) { printf("+%s\r\n", s); }
 static void resp_error(const char *msg) { printf("-%s\r\n", msg); }
-static void __attribute__((unused)) resp_integer(long long n) {
-  printf(":%lld\r\n", n);
-}
+static void resp_integer(long long n) { printf(":%lld\r\n", n); }
 static void resp_bulk(const char *data, int len) {
   printf("$%d\r\n", len);
   if (len > 0)
@@ -374,6 +372,9 @@ static void hm_set(HashMap *m, const char *key, int klen, const char *val,
   m->count++;
 }
 
+/* LIVE key count. TTL lesson will change this to skip lapsed keys. */
+static long hm_live_count(const HashMap *m) { return (long)m->count; }
+
 static HashMap DB;
 
 /* ============================================================
@@ -387,10 +388,8 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1},
-    {"ECHO", 1, 1},
-    {"SET", 2, 2},
-    {"GET", 1, 1},
+    {"PING", 0, 1}, {"ECHO", 1, 1},   {"SET", 2, 2},
+    {"GET", 1, 1},  {"DBSIZE", 0, 0},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -456,6 +455,8 @@ static void handle_command(Bulk args[], int argc) {
       resp_bulk(s->val, s->vlen);
     else
       resp_null_bulk();
+  } else if (strcmp(cmd, "DBSIZE") == 0) {
+    resp_integer(hm_live_count(&DB));
   }
   fflush(stdout);
 }
@@ -474,10 +475,9 @@ int main(void) {
   for (;;) {
     int first = reader_peekc(&r);
     if (first < 0)
-      break; /* EOF */
+      break;
 
     if (first == '*') {
-      /* RESP array request */
       char *errmsg = NULL;
       int argc = parse_resp_request(&r, args, MAX_ARGS, &errmsg);
       if (argc < 0) {
@@ -490,7 +490,6 @@ int main(void) {
         handle_command(args, argc);
       free_args(args, argc);
     } else {
-      /* Text line request */
       char *line = reader_read_rawline(&r);
       if (!line)
         break;
@@ -499,7 +498,7 @@ int main(void) {
         if (argc > 0)
           handle_command(args, argc);
       }
-      free(line); /* args[i].data point into `line`; do not free_args */
+      free(line); /* args[i].data alias into `line`; do NOT free_args */
     }
   }
 
