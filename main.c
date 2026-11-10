@@ -290,7 +290,7 @@ typedef struct {
   char *val;
   int vlen;
   int used;
-  long long expire_at_ms; /* 0 = no expiry (persists) */
+  long long expire_at_ms; /* 0 = no expiry */
 } Slot;
 
 typedef struct {
@@ -356,8 +356,11 @@ static Slot *hm_get(HashMap *m, const char *key, int klen) {
   size_t i = hm_find_slot(m, key, klen);
   return m->slots[i].used ? &m->slots[i] : NULL;
 }
-static void hm_set(HashMap *m, const char *key, int klen, const char *val,
-                   int vlen) {
+
+/* Set key with optional TTL (expire_at_ms == 0 means "no TTL").
+ * Plain SET always resets the TTL (real Redis: SET replaces metadata). */
+static void hm_set_ttl(HashMap *m, const char *key, int klen, const char *val,
+                       int vlen, long long expire_at_ms) {
   if ((m->count + 1) * 10 >= m->cap * 7)
     hm_grow(m);
   size_t i = hm_find_slot(m, key, klen);
@@ -366,8 +369,7 @@ static void hm_set(HashMap *m, const char *key, int klen, const char *val,
     m->slots[i].val = (char *)malloc((size_t)vlen);
     memcpy(m->slots[i].val, val, (size_t)vlen);
     m->slots[i].vlen = vlen;
-    /* plain SET clears any existing TTL (matches real Redis) */
-    m->slots[i].expire_at_ms = 0;
+    m->slots[i].expire_at_ms = expire_at_ms; /* replace, incl. 0 */
     return;
   }
   m->slots[i].used = 1;
@@ -377,23 +379,23 @@ static void hm_set(HashMap *m, const char *key, int klen, const char *val,
   m->slots[i].val = (char *)malloc((size_t)vlen);
   memcpy(m->slots[i].val, val, (size_t)vlen);
   m->slots[i].vlen = vlen;
-  m->slots[i].expire_at_ms = 0;
+  m->slots[i].expire_at_ms = expire_at_ms;
   m->count++;
 }
 
-/* Physically remove a key (free key/val, clear slot). Linear probing
- * on open addressing makes this slightly delicate, but we defer this
- * to the Passive Expiry lesson. For now, "delete on EXPIRE <= 0" is
- * simulated by marking the slot as having an already-past deadline;
- * TTL and future passive-expiry checks will then treat it as gone. */
+/* Convenience wrapper: plain SET (no TTL) */
+static void hm_set(HashMap *m, const char *key, int klen, const char *val,
+                   int vlen) {
+  hm_set_ttl(m, key, klen, val, vlen, 0);
+}
+
 static void slot_mark_expired(Slot *s) {
   if (!s)
     return;
   if (s->expire_at_ms == 0 || s->expire_at_ms > now_ms())
-    s->expire_at_ms = now_ms(); /* deadline in the past/now */
+    s->expire_at_ms = now_ms();
 }
 
-/* A slot is live if it exists and hasn't passed its deadline. */
 static int key_is_live(Slot *s) {
   if (!s)
     return 0;
@@ -469,10 +471,11 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1},   {"ECHO", 1, 1},   {"SET", 2, 4},  {"GET", 1, 1},
-    {"DBSIZE", 0, 0}, {"INCR", 1, 1},   {"DECR", 1, 1}, {"INCRBY", 2, 2},
-    {"DECRBY", 2, 2}, {"EXPIRE", 2, 2}, {"TTL", 1, 1},  {"PERSIST", 1, 1},
-    {"WAIT", 1, 1},
+    {"PING", 0, 1},   {"ECHO", 1, 1},    {"SET", 2, 6}, /* key value [EX n|PX
+                                                           n|NX|XX]... */
+    {"GET", 1, 1},    {"DBSIZE", 0, 0},  {"INCR", 1, 1},   {"DECR", 1, 1},
+    {"INCRBY", 2, 2}, {"DECRBY", 2, 2},  {"EXPIRE", 2, 2}, {"TTL", 1, 1},
+    {"PTTL", 1, 1},   {"PERSIST", 1, 1}, {"WAIT", 1, 1},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -530,7 +533,12 @@ static void handle_command(Bulk args[], int argc) {
   } else if (strcmp(cmd, "ECHO") == 0) {
     resp_bulk(args[1].data, args[1].len);
   } else if (strcmp(cmd, "SET") == 0) {
-    int nx = 0, xx = 0, bad_flag = 0;
+    int nx = 0, xx = 0;
+    int have_ex = 0, have_px = 0;
+    long long ttl_ms = 0;
+    int bad_flag = 0;
+    int non_int = 0;
+
     for (int i = 3; i < argc; i++) {
       char f[16];
       int flen = args[i].len;
@@ -542,16 +550,42 @@ static void handle_command(Bulk args[], int argc) {
       f[flen] = '\0';
       for (int k = 0; k < flen; k++)
         f[k] = (char)toupper((unsigned char)f[k]);
-      if (strcmp(f, "NX") == 0)
+
+      if (strcmp(f, "NX") == 0) {
         nx = 1;
-      else if (strcmp(f, "XX") == 0)
+      } else if (strcmp(f, "XX") == 0) {
         xx = 1;
-      else {
+      } else if (strcmp(f, "EX") == 0 || strcmp(f, "PX") == 0) {
+        if (i + 1 >= argc) {
+          bad_flag = 1;
+          break;
+        }
+        long long n;
+        if (!parse_ll_strict(args[i + 1].data, args[i + 1].len, &n)) {
+          non_int = 1;
+          break;
+        }
+        if (n < 0) {
+          non_int = 1;
+          break;
+        }
+        if (strcmp(f, "EX") == 0) {
+          have_ex = 1;
+          ttl_ms = n * 1000LL;
+        } else {
+          have_px = 1;
+          ttl_ms = n;
+        }
+        i++; /* consume duration token */
+      } else {
         bad_flag = 1;
         break;
       }
     }
-    if (bad_flag || (nx && xx)) {
+
+    if (non_int) {
+      resp_error("ERR value is not an integer or out of range");
+    } else if (bad_flag || (nx && xx) || (have_ex && have_px)) {
       resp_error("ERR syntax error");
     } else {
       Slot *s = hm_get(&DB, args[1].data, args[1].len);
@@ -559,7 +593,9 @@ static void handle_command(Bulk args[], int argc) {
       if ((nx && exists) || (xx && !exists)) {
         resp_null_bulk();
       } else {
-        hm_set(&DB, args[1].data, args[1].len, args[2].data, args[2].len);
+        long long deadline = (ttl_ms > 0) ? now_ms() + ttl_ms : 0;
+        hm_set_ttl(&DB, args[1].data, args[1].len, args[2].data, args[2].len,
+                   deadline);
         resp_simple_string("OK");
       }
     }
@@ -596,9 +632,8 @@ static void handle_command(Bulk args[], int argc) {
     } else {
       Slot *s = hm_get(&DB, args[1].data, args[1].len);
       if (!s) {
-        resp_integer(0); /* key absent */
+        resp_integer(0);
       } else if (secs <= 0) {
-        /* real Redis: EXPIRE <= 0 deletes immediately, returns 1 */
         slot_mark_expired(s);
         resp_integer(1);
       } else {
@@ -609,18 +644,30 @@ static void handle_command(Bulk args[], int argc) {
   } else if (strcmp(cmd, "TTL") == 0) {
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
     if (!s) {
-      resp_integer(-2); /* key doesn't exist */
+      resp_integer(-2);
     } else if (s->expire_at_ms == 0) {
-      resp_integer(-1); /* exists, no expiry */
+      resp_integer(-1);
     } else {
       long long remaining_ms = s->expire_at_ms - now_ms();
-      if (remaining_ms <= 0) {
-        resp_integer(-2); /* already expired */
-      } else {
-        /* round-to-nearest, matching Python's round() on seconds */
+      if (remaining_ms <= 0)
+        resp_integer(-2);
+      else {
         long long secs = (remaining_ms + 500) / 1000;
         resp_integer(secs);
       }
+    }
+  } else if (strcmp(cmd, "PTTL") == 0) {
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s) {
+      resp_integer(-2);
+    } else if (s->expire_at_ms == 0) {
+      resp_integer(-1);
+    } else {
+      long long remaining_ms = s->expire_at_ms - now_ms();
+      if (remaining_ms <= 0)
+        resp_integer(-2);
+      else
+        resp_integer(remaining_ms);
     }
   } else if (strcmp(cmd, "PERSIST") == 0) {
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
