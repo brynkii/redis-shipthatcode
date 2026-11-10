@@ -13,16 +13,14 @@ typedef struct {
 } Bulk;
 
 /* ============================================================
- * Virtual clock (tests drive it via WAIT <ms>)
+ * Virtual clock
  * ============================================================ */
-
 static long long virtual_now_ms = 0;
 static long long now_ms(void) { return virtual_now_ms; }
 
 /* ============================================================
  * Buffered reader over stdin (binary safe)
  * ============================================================ */
-
 typedef struct {
   unsigned char *buf;
   size_t cap, len, pos;
@@ -79,7 +77,6 @@ static int reader_read(Reader *r, unsigned char *out, size_t n) {
   }
   return 1;
 }
-
 static char *reader_readline(Reader *r) {
   size_t cap = 64, len = 0;
   char *out = (char *)malloc(cap);
@@ -103,7 +100,6 @@ static char *reader_readline(Reader *r) {
   out[len] = '\0';
   return out;
 }
-
 static int reader_consume_terminator(Reader *r) {
   int c = reader_getc(r);
   if (c == '\n')
@@ -114,7 +110,6 @@ static int reader_consume_terminator(Reader *r) {
   }
   return 0;
 }
-
 static char *reader_read_rawline(Reader *r) {
   size_t cap = 128, len = 0;
   char *out = (char *)malloc(cap);
@@ -142,14 +137,12 @@ static char *reader_read_rawline(Reader *r) {
 }
 
 /* ============================================================
- * RESP array request parser (binary safe)
+ * RESP array parser
  * ============================================================ */
-
 static void free_args(Bulk args[], int argc) {
   for (int i = 0; i < argc; i++)
     free(args[i].data);
 }
-
 static int parse_resp_request(Reader *r, Bulk args[], int max_args,
                               char **errmsg) {
   int c = reader_getc(r);
@@ -159,13 +152,11 @@ static int parse_resp_request(Reader *r, Bulk args[], int max_args,
     *errmsg = strdup("ERR Protocol error: expected '*'");
     return -1;
   }
-
   char *line = reader_readline(r);
   if (!line) {
     *errmsg = strdup("ERR Protocol error: truncated array header");
     return -1;
   }
-
   char *endp = NULL;
   long n = strtol(line, &endp, 10);
   int bad = (!endp || *endp != '\0' || n < 0);
@@ -180,7 +171,6 @@ static int parse_resp_request(Reader *r, Bulk args[], int max_args,
     *errmsg = strdup("ERR Protocol error: too many arguments");
     return -1;
   }
-
   int argc = 0;
   for (long i = 0; i < n; i++) {
     int t = reader_getc(r);
@@ -228,12 +218,9 @@ static int parse_resp_request(Reader *r, Bulk args[], int max_args,
 /* ============================================================
  * Text line parser (space separated, "..." quoting)
  * ============================================================ */
-
 static int parse_text_request(char *line, Bulk args[], int max_args) {
-  int count = 0;
-  int in_quotes = 0;
+  int count = 0, in_quotes = 0;
   char *start = NULL;
-
   for (char *p = line; *p && count < max_args; p++) {
     if (*p == '"' && !in_quotes) {
       in_quotes = 1;
@@ -266,9 +253,8 @@ static int parse_text_request(char *line, Bulk args[], int max_args) {
 }
 
 /* ============================================================
- * RESP response serialization
+ * RESP serialization
  * ============================================================ */
-
 static void resp_simple_string(const char *s) { printf("+%s\r\n", s); }
 static void resp_error(const char *msg) { printf("-%s\r\n", msg); }
 static void resp_integer(long long n) { printf(":%lld\r\n", n); }
@@ -281,15 +267,14 @@ static void resp_bulk(const char *data, int len) {
 static void resp_null_bulk(void) { printf("$-1\r\n"); }
 
 /* ============================================================
- * In-memory hash map (binary-safe) + per-slot expiry
+ * Hash map with tri-state slots (0 empty, 1 occupied, 2 tombstone)
  * ============================================================ */
-
 typedef struct {
   char *key;
   int klen;
   char *val;
   int vlen;
-  int used;
+  int used;               /* 0 empty | 1 occupied | 2 tombstone */
   long long expire_at_ms; /* 0 = no expiry */
 } Slot;
 
@@ -318,7 +303,7 @@ static void hm_init(HashMap *m, size_t cap) {
 }
 static void hm_free(HashMap *m) {
   for (size_t i = 0; i < m->cap; i++)
-    if (m->slots[i].used) {
+    if (m->slots[i].used == 1) {
       free(m->slots[i].key);
       free(m->slots[i].val);
     }
@@ -326,17 +311,23 @@ static void hm_free(HashMap *m) {
   m->slots = NULL;
   m->cap = m->count = 0;
 }
+
+/* Find matching slot, or insertion index (first tombstone if any). */
 static size_t hm_find_slot(const HashMap *m, const char *key, int klen) {
   uint64_t h = fnv1a(key, (size_t)klen);
   size_t mask = m->cap - 1, i = (size_t)h & mask;
-  while (m->slots[i].used) {
-    if (m->slots[i].klen == klen &&
+  size_t first_tomb = (size_t)-1;
+  while (m->slots[i].used != 0) {
+    if (m->slots[i].used == 1 && m->slots[i].klen == klen &&
         memcmp(m->slots[i].key, key, (size_t)klen) == 0)
       return i;
+    if (m->slots[i].used == 2 && first_tomb == (size_t)-1)
+      first_tomb = i;
     i = (i + 1) & mask;
   }
-  return i;
+  return (first_tomb != (size_t)-1) ? first_tomb : i;
 }
+
 static void hm_grow(HashMap *m) {
   size_t newcap = m->cap * 2;
   Slot *old = m->slots;
@@ -345,33 +336,33 @@ static void hm_grow(HashMap *m) {
   m->cap = newcap;
   m->count = 0;
   for (size_t i = 0; i < oldcap; i++)
-    if (old[i].used) {
+    if (old[i].used == 1) {
       size_t j = hm_find_slot(m, old[i].key, old[i].klen);
       m->slots[j] = old[i];
       m->count++;
     }
   free(old);
 }
+
 static Slot *hm_get(HashMap *m, const char *key, int klen) {
   size_t i = hm_find_slot(m, key, klen);
-  return m->slots[i].used ? &m->slots[i] : NULL;
+  return (m->slots[i].used == 1) ? &m->slots[i] : NULL;
 }
 
-/* Set key with optional TTL (expire_at_ms == 0 means "no TTL").
- * Plain SET always resets the TTL (real Redis: SET replaces metadata). */
 static void hm_set_ttl(HashMap *m, const char *key, int klen, const char *val,
                        int vlen, long long expire_at_ms) {
   if ((m->count + 1) * 10 >= m->cap * 7)
     hm_grow(m);
   size_t i = hm_find_slot(m, key, klen);
-  if (m->slots[i].used) {
+  if (m->slots[i].used == 1) {
     free(m->slots[i].val);
     m->slots[i].val = (char *)malloc((size_t)vlen);
     memcpy(m->slots[i].val, val, (size_t)vlen);
     m->slots[i].vlen = vlen;
-    m->slots[i].expire_at_ms = expire_at_ms; /* replace, incl. 0 */
+    m->slots[i].expire_at_ms = expire_at_ms;
     return;
   }
+  /* empty or tombstone: fresh insert */
   m->slots[i].used = 1;
   m->slots[i].key = (char *)malloc((size_t)klen);
   memcpy(m->slots[i].key, key, (size_t)klen);
@@ -383,35 +374,44 @@ static void hm_set_ttl(HashMap *m, const char *key, int klen, const char *val,
   m->count++;
 }
 
-/* Convenience wrapper: plain SET (no TTL) */
 static void hm_set(HashMap *m, const char *key, int klen, const char *val,
                    int vlen) {
   hm_set_ttl(m, key, klen, val, vlen, 0);
 }
 
-static void slot_mark_expired(Slot *s) {
-  if (!s)
-    return;
-  if (s->expire_at_ms == 0 || s->expire_at_ms > now_ms())
-    s->expire_at_ms = now_ms();
-}
-
-static int key_is_live(Slot *s) {
-  if (!s)
-    return 0;
-  if (s->expire_at_ms != 0 && now_ms() >= s->expire_at_ms)
-    return 0;
-  return 1;
-}
-
-static long hm_live_count(const HashMap *m) { return (long)m->count; }
-
 static HashMap DB;
 
-/* ============================================================
- * Integer parsing helpers
- * ============================================================ */
+static int expire_if_needed_impl(const char *key, int klen) {
+  Slot *s = hm_get(&DB, key, klen);
+  if (!s)
+    return 0;
+  if (s->expire_at_ms != 0 && now_ms() >= s->expire_at_ms) {
+    free(s->key);
+    free(s->val);
+    s->key = NULL;
+    s->val = NULL;
+    s->klen = s->vlen = 0;
+    s->expire_at_ms = 0;
+    s->used = 2; /* tombstone */
+    DB.count--;
+    return 1;
+  }
+  return 0;
+}
 
+/* Live count for DBSIZE: occupied slots whose TTL hasn't lapsed. */
+static long hm_live_count(HashMap *m) {
+  long n = 0;
+  for (size_t i = 0; i < m->cap; i++)
+    if (m->slots[i].used == 1 &&
+        (m->slots[i].expire_at_ms == 0 || now_ms() < m->slots[i].expire_at_ms))
+      n++;
+  return n;
+}
+
+/* ============================================================
+ * Integer helpers
+ * ============================================================ */
 static int parse_ll_strict(const char *s, int len, long long *out) {
   if (len <= 0)
     return 0;
@@ -437,23 +437,22 @@ static int parse_ll_strict(const char *s, int len, long long *out) {
 
 static void do_incr_by(Bulk args[], int key_idx, long long delta) {
   Bulk *key = &args[key_idx];
+  expire_if_needed_impl(key->data, key->len);
 
   long long current = 0;
   Slot *s = hm_get(&DB, key->data, key->len);
-  if (s && key_is_live(s)) {
+  if (s) {
     if (!parse_ll_strict(s->val, s->vlen, &current)) {
       resp_error("ERR value is not an integer or out of range");
       return;
     }
   }
-
   if ((delta > 0 && current > LLONG_MAX - delta) ||
       (delta < 0 && current < LLONG_MIN - delta)) {
     resp_error("ERR increment or decrement would overflow");
     return;
   }
   long long n = current + delta;
-
   char buf[32];
   int blen = snprintf(buf, sizeof(buf), "%lld", n);
   hm_set(&DB, key->data, key->len, buf, blen);
@@ -461,9 +460,8 @@ static void do_incr_by(Bulk args[], int key_idx, long long delta) {
 }
 
 /* ============================================================
- * Command table + arity
+ * Command table
  * ============================================================ */
-
 typedef struct {
   const char *name;
   int min_args;
@@ -471,9 +469,8 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1},   {"ECHO", 1, 1},    {"SET", 2, 6}, /* key value [EX n|PX
-                                                           n|NX|XX]... */
-    {"GET", 1, 1},    {"DBSIZE", 0, 0},  {"INCR", 1, 1},   {"DECR", 1, 1},
+    {"PING", 0, 1},   {"ECHO", 1, 1},    {"SET", 2, 6},    {"GET", 1, 1},
+    {"EXISTS", 1, 1}, {"DBSIZE", 0, 0},  {"INCR", 1, 1},   {"DECR", 1, 1},
     {"INCRBY", 2, 2}, {"DECRBY", 2, 2},  {"EXPIRE", 2, 2}, {"TTL", 1, 1},
     {"PTTL", 1, 1},   {"PERSIST", 1, 1}, {"WAIT", 1, 1},
 };
@@ -500,7 +497,6 @@ static int check_arity(const CommandSpec *spec, int argc) {
 /* ============================================================
  * Dispatcher
  * ============================================================ */
-
 static void handle_command(Bulk args[], int argc) {
   char cmd[256];
   int cmdlen = args[0].len;
@@ -533,11 +529,8 @@ static void handle_command(Bulk args[], int argc) {
   } else if (strcmp(cmd, "ECHO") == 0) {
     resp_bulk(args[1].data, args[1].len);
   } else if (strcmp(cmd, "SET") == 0) {
-    int nx = 0, xx = 0;
-    int have_ex = 0, have_px = 0;
+    int nx = 0, xx = 0, have_ex = 0, have_px = 0, bad_flag = 0, non_int = 0;
     long long ttl_ms = 0;
-    int bad_flag = 0;
-    int non_int = 0;
 
     for (int i = 3; i < argc; i++) {
       char f[16];
@@ -551,21 +544,17 @@ static void handle_command(Bulk args[], int argc) {
       for (int k = 0; k < flen; k++)
         f[k] = (char)toupper((unsigned char)f[k]);
 
-      if (strcmp(f, "NX") == 0) {
+      if (strcmp(f, "NX") == 0)
         nx = 1;
-      } else if (strcmp(f, "XX") == 0) {
+      else if (strcmp(f, "XX") == 0)
         xx = 1;
-      } else if (strcmp(f, "EX") == 0 || strcmp(f, "PX") == 0) {
+      else if (strcmp(f, "EX") == 0 || strcmp(f, "PX") == 0) {
         if (i + 1 >= argc) {
           bad_flag = 1;
           break;
         }
         long long n;
-        if (!parse_ll_strict(args[i + 1].data, args[i + 1].len, &n)) {
-          non_int = 1;
-          break;
-        }
-        if (n < 0) {
+        if (!parse_ll_strict(args[i + 1].data, args[i + 1].len, &n) || n < 0) {
           non_int = 1;
           break;
         }
@@ -576,7 +565,7 @@ static void handle_command(Bulk args[], int argc) {
           have_px = 1;
           ttl_ms = n;
         }
-        i++; /* consume duration token */
+        i++;
       } else {
         bad_flag = 1;
         break;
@@ -588,8 +577,10 @@ static void handle_command(Bulk args[], int argc) {
     } else if (bad_flag || (nx && xx) || (have_ex && have_px)) {
       resp_error("ERR syntax error");
     } else {
+      /* lazy-expire before NX/XX sees the key */
+      expire_if_needed_impl(args[1].data, args[1].len);
       Slot *s = hm_get(&DB, args[1].data, args[1].len);
-      int exists = key_is_live(s);
+      int exists = (s != NULL);
       if ((nx && exists) || (xx && !exists)) {
         resp_null_bulk();
       } else {
@@ -600,11 +591,16 @@ static void handle_command(Bulk args[], int argc) {
       }
     }
   } else if (strcmp(cmd, "GET") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
-    if (s && key_is_live(s))
+    if (s)
       resp_bulk(s->val, s->vlen);
     else
       resp_null_bulk();
+  } else if (strcmp(cmd, "EXISTS") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    resp_integer(s ? 1 : 0);
   } else if (strcmp(cmd, "DBSIZE") == 0) {
     resp_integer(hm_live_count(&DB));
   } else if (strcmp(cmd, "INCR") == 0) {
@@ -630,11 +626,20 @@ static void handle_command(Bulk args[], int argc) {
     if (!parse_ll_strict(args[2].data, args[2].len, &secs)) {
       resp_error("ERR value is not an integer or out of range");
     } else {
+      expire_if_needed_impl(args[1].data, args[1].len);
       Slot *s = hm_get(&DB, args[1].data, args[1].len);
-      if (!s) {
+      if (!s)
         resp_integer(0);
-      } else if (secs <= 0) {
-        slot_mark_expired(s);
+      else if (secs <= 0) {
+        /* immediate delete = physical tombstone */
+        free(s->key);
+        free(s->val);
+        s->key = NULL;
+        s->val = NULL;
+        s->klen = s->vlen = 0;
+        s->expire_at_ms = 0;
+        s->used = 2;
+        DB.count--;
         resp_integer(1);
       } else {
         s->expire_at_ms = now_ms() + secs * 1000LL;
@@ -642,46 +647,47 @@ static void handle_command(Bulk args[], int argc) {
       }
     }
   } else if (strcmp(cmd, "TTL") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
-    if (!s) {
+    if (!s)
       resp_integer(-2);
-    } else if (s->expire_at_ms == 0) {
+    else if (s->expire_at_ms == 0)
       resp_integer(-1);
-    } else {
-      long long remaining_ms = s->expire_at_ms - now_ms();
-      if (remaining_ms <= 0)
-        resp_integer(-2);
-      else {
-        long long secs = (remaining_ms + 500) / 1000;
-        resp_integer(secs);
-      }
-    }
-  } else if (strcmp(cmd, "PTTL") == 0) {
-    Slot *s = hm_get(&DB, args[1].data, args[1].len);
-    if (!s) {
-      resp_integer(-2);
-    } else if (s->expire_at_ms == 0) {
-      resp_integer(-1);
-    } else {
-      long long remaining_ms = s->expire_at_ms - now_ms();
-      if (remaining_ms <= 0)
+    else {
+      long long rem = s->expire_at_ms - now_ms();
+      if (rem <= 0)
         resp_integer(-2);
       else
-        resp_integer(remaining_ms);
+        resp_integer((rem + 500) / 1000);
+    }
+  } else if (strcmp(cmd, "PTTL") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s)
+      resp_integer(-2);
+    else if (s->expire_at_ms == 0)
+      resp_integer(-1);
+    else {
+      long long rem = s->expire_at_ms - now_ms();
+      if (rem <= 0)
+        resp_integer(-2);
+      else
+        resp_integer(rem);
     }
   } else if (strcmp(cmd, "PERSIST") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
-    if (!s || s->expire_at_ms == 0) {
+    if (!s || s->expire_at_ms == 0)
       resp_integer(0);
-    } else {
+    else {
       s->expire_at_ms = 0;
       resp_integer(1);
     }
   } else if (strcmp(cmd, "WAIT") == 0) {
     long long ms;
-    if (!parse_ll_strict(args[1].data, args[1].len, &ms) || ms < 0) {
+    if (!parse_ll_strict(args[1].data, args[1].len, &ms) || ms < 0)
       resp_error("ERR value is not an integer or out of range");
-    } else {
+    else {
       virtual_now_ms += ms;
       resp_simple_string("OK");
     }
@@ -692,10 +698,8 @@ static void handle_command(Bulk args[], int argc) {
 /* ============================================================
  * Main
  * ============================================================ */
-
 int main(void) {
   hm_init(&DB, 1024);
-
   Reader r;
   reader_init(&r);
   Bulk args[MAX_ARGS];
@@ -704,7 +708,6 @@ int main(void) {
     int first = reader_peekc(&r);
     if (first < 0)
       break;
-
     if (first == '*') {
       char *errmsg = NULL;
       int argc = parse_resp_request(&r, args, MAX_ARGS, &errmsg);
@@ -729,7 +732,6 @@ int main(void) {
       free(line);
     }
   }
-
   reader_free(&r);
   hm_free(&DB);
   return 0;
