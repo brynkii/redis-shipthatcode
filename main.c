@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -255,7 +256,7 @@ static int parse_text_request(char *line, Bulk args[], int max_args) {
 }
 
 /* ============================================================
- * RESP serialization (writes to g_out)
+ * RESP serialization
  * ============================================================ */
 static void resp_simple_string(const char *s) { fprintf(g_out, "+%s\r\n", s); }
 static void resp_error(const char *msg) { fprintf(g_out, "-%s\r\n", msg); }
@@ -268,12 +269,6 @@ static void resp_bulk(const char *data, int len) {
 }
 static void resp_null_bulk(void) { fprintf(g_out, "$-1\r\n"); }
 static void resp_array_header(int n) { fprintf(g_out, "*%d\r\n", n); }
-
-static void encode_array(const char **items, const int *lens, int count) {
-  resp_array_header(count);
-  for (int i = 0; i < count; i++)
-    resp_bulk(items[i], lens[i]);
-}
 
 /* ============================================================
  * FNV-1a
@@ -320,7 +315,7 @@ static void format_score(double s, char *buf, int bufsize) {
 }
 
 /* ============================================================
- * Hash / Set / ZSet — unchanged from step 20
+ * Hash
  * ============================================================ */
 static uint64_t hash_seq_counter = 0;
 typedef struct HashField {
@@ -429,6 +424,9 @@ static int cmp_hash_seq(const void *a, const void *b) {
   return 0;
 }
 
+/* ============================================================
+ * Set
+ * ============================================================ */
 typedef struct SetMember {
   char *data;
   int len;
@@ -508,6 +506,9 @@ static int set_remove(Set *s, const char *data, int len) {
   return 1;
 }
 
+/* ============================================================
+ * ZSet
+ * ============================================================ */
 typedef struct ZSetEntry {
   char *member;
   int mlen;
@@ -608,6 +609,86 @@ static ZSetEntry **zset_sorted(const ZSet *z, int *out_n) {
       arr[k++] = &z->entries[i];
   qsort(arr, (size_t)n, sizeof(ZSetEntry *), cmp_zset);
   return arr;
+}
+
+/* ============================================================
+ * Pub/Sub state
+ * ============================================================ */
+typedef struct {
+  char *name;
+  int len;
+  Set subs;
+  int used;
+} ChannelEntry;
+typedef struct {
+  ChannelEntry *entries;
+  size_t cap, count;
+} Channels;
+
+static Channels PUBSUB = {0};
+static Set MY_SUBS;
+static int MY_SUBS_INIT = 0;
+static const char *SUB_ID = "self";
+static const int SUB_ID_LEN = 4;
+
+static size_t channels_find_slot(const Channels *c, const char *name, int len) {
+  uint64_t h = fnv1a(name, (size_t)len);
+  size_t mask = c->cap - 1, i = (size_t)h & mask, first_tomb = (size_t)-1;
+  while (c->entries[i].used != 0) {
+    if (c->entries[i].used == 1 && c->entries[i].len == len &&
+        memcmp(c->entries[i].name, name, (size_t)len) == 0)
+      return i;
+    if (c->entries[i].used == 2 && first_tomb == (size_t)-1)
+      first_tomb = i;
+    i = (i + 1) & mask;
+  }
+  return (first_tomb != (size_t)-1) ? first_tomb : i;
+}
+static void channels_grow(Channels *c) {
+  size_t newcap = c->cap * 2;
+  ChannelEntry *old = c->entries;
+  size_t oldcap = c->cap;
+  c->entries = calloc(newcap, sizeof(ChannelEntry));
+  c->cap = newcap;
+  c->count = 0;
+  for (size_t i = 0; i < oldcap; i++)
+    if (old[i].used == 1) {
+      size_t j = channels_find_slot(c, old[i].name, old[i].len);
+      c->entries[j] = old[i];
+      c->count++;
+    }
+  free(old);
+}
+static ChannelEntry *channels_get(Channels *c, const char *name, int len) {
+  if (c->cap == 0)
+    return NULL;
+  size_t i = channels_find_slot(c, name, len);
+  return (c->entries[i].used == 1) ? &c->entries[i] : NULL;
+}
+static ChannelEntry *channels_ensure(Channels *c, const char *name, int len) {
+  if (c->cap == 0) {
+    c->cap = 8;
+    c->count = 0;
+    c->entries = calloc(c->cap, sizeof(ChannelEntry));
+  }
+  if ((c->count + 1) * 10 >= c->cap * 7)
+    channels_grow(c);
+  size_t i = channels_find_slot(c, name, len);
+  if (c->entries[i].used == 1)
+    return &c->entries[i];
+  c->entries[i].used = 1;
+  c->entries[i].name = malloc((size_t)len);
+  memcpy(c->entries[i].name, name, (size_t)len);
+  c->entries[i].len = len;
+  set_init(&c->entries[i].subs);
+  c->count++;
+  return &c->entries[i];
+}
+static void pubsub_init(void) {
+  if (!MY_SUBS_INIT) {
+    set_init(&MY_SUBS);
+    MY_SUBS_INIT = 1;
+  }
 }
 
 /* ============================================================
@@ -1061,21 +1142,22 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1},      {"ECHO", 1, 1},    {"SET", 2, 6},
-    {"GET", 1, 1},       {"DEL", 1, -1},    {"EXISTS", 1, -1},
-    {"KEYS", 1, 1},      {"TYPE", 1, 1},    {"RENAME", 2, 2},
-    {"DBSIZE", 0, 0},    {"INCR", 1, 1},    {"DECR", 1, 1},
-    {"INCRBY", 2, 2},    {"DECRBY", 2, 2},  {"EXPIRE", 2, 2},
-    {"TTL", 1, 1},       {"PTTL", 1, 1},    {"PERSIST", 1, 1},
-    {"WAIT", 1, 1},      {"LPUSH", 2, -1},  {"RPUSH", 2, -1},
-    {"LRANGE", 3, 3},    {"LPOP", 1, 1},    {"RPOP", 1, 1},
-    {"LLEN", 1, 1},      {"HSET", 3, -1},   {"HGET", 2, 2},
-    {"HDEL", 2, -1},     {"HGETALL", 1, 1}, {"HEXISTS", 2, 2},
-    {"HLEN", 1, 1},      {"SADD", 2, -1},   {"SMEMBERS", 1, 1},
-    {"SISMEMBER", 2, 2}, {"SCARD", 1, 1},   {"SREM", 2, -1},
-    {"ZADD", 3, -1},     {"ZSCORE", 2, 2},  {"ZRANGE", 3, 4},
-    {"ZRANK", 2, 2},     {"ZCARD", 1, 1},   {"MULTI", 0, 0},
-    {"EXEC", 0, 0},      {"DISCARD", 0, 0},
+    {"PING", 0, 1},         {"ECHO", 1, 1},    {"SET", 2, 6},
+    {"GET", 1, 1},          {"DEL", 1, -1},    {"EXISTS", 1, -1},
+    {"KEYS", 1, 1},         {"TYPE", 1, 1},    {"RENAME", 2, 2},
+    {"DBSIZE", 0, 0},       {"INCR", 1, 1},    {"DECR", 1, 1},
+    {"INCRBY", 2, 2},       {"DECRBY", 2, 2},  {"EXPIRE", 2, 2},
+    {"TTL", 1, 1},          {"PTTL", 1, 1},    {"PERSIST", 1, 1},
+    {"WAIT", 1, 1},         {"LPUSH", 2, -1},  {"RPUSH", 2, -1},
+    {"LRANGE", 3, 3},       {"LPOP", 1, 1},    {"RPOP", 1, 1},
+    {"LLEN", 1, 1},         {"HSET", 3, -1},   {"HGET", 2, 2},
+    {"HDEL", 2, -1},        {"HGETALL", 1, 1}, {"HEXISTS", 2, 2},
+    {"HLEN", 1, 1},         {"SADD", 2, -1},   {"SMEMBERS", 1, 1},
+    {"SISMEMBER", 2, 2},    {"SCARD", 1, 1},   {"SREM", 2, -1},
+    {"ZADD", 3, -1},        {"ZSCORE", 2, 2},  {"ZRANGE", 3, 4},
+    {"ZRANK", 2, 2},        {"ZCARD", 1, 1},   {"MULTI", 0, 0},
+    {"EXEC", 0, 0},         {"DISCARD", 0, 0}, {"SUBSCRIBE", 1, -1},
+    {"UNSUBSCRIBE", 0, -1}, {"PUBLISH", 2, 2},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -1098,7 +1180,7 @@ static int check_arity(const CommandSpec *spec, int argc) {
 }
 
 /* ============================================================
- * EXECUTE — real per-command executor (no MULTI/EXEC/DISCARD)
+ * EXECUTE — real per-command executor
  * ============================================================ */
 static void execute_command(Bulk args[], int argc) {
   char cmd[256];
@@ -1121,8 +1203,6 @@ static void execute_command(Bulk args[], int argc) {
   if (!check_arity(spec, argc))
     return;
 
-  /* ... unchanged branches for PING .. ZCARD, RENAME, DEL, EXISTS, KEYS, TYPE
-   * ... */
   if (strcmp(cmd, "PING") == 0) {
     if (argc == 1)
       resp_simple_string("PONG");
@@ -1724,6 +1804,63 @@ static void execute_command(Bulk args[], int argc) {
       resp_error(WRONGTYPE_MSG);
     else
       resp_integer((long long)s->zset.count);
+  } else if (strcmp(cmd, "SUBSCRIBE") == 0) {
+    for (int i = 1; i < argc; i++) {
+      ChannelEntry *ce = channels_ensure(&PUBSUB, args[i].data, args[i].len);
+      set_add(&ce->subs, SUB_ID, SUB_ID_LEN);
+      set_add(&MY_SUBS, args[i].data, args[i].len);
+      fprintf(g_out, "+subscribe %.*s %d\r\n", args[i].len, args[i].data,
+              (int)MY_SUBS.count);
+    }
+  } else if (strcmp(cmd, "UNSUBSCRIBE") == 0) {
+    if (argc == 1) {
+      if (MY_SUBS.count == 0) {
+        fprintf(g_out, "+unsubscribe 0\r\n");
+      } else {
+        int n = (int)MY_SUBS.count;
+        char **names = malloc(sizeof(char *) * (size_t)n);
+        int *lens = malloc(sizeof(int) * (size_t)n);
+        int k = 0;
+        for (size_t j = 0; j < MY_SUBS.cap; j++)
+          if (MY_SUBS.entries[j].used == 1) {
+            int len = MY_SUBS.entries[j].len;
+            names[k] = malloc((size_t)len);
+            memcpy(names[k], MY_SUBS.entries[j].data, (size_t)len);
+            lens[k] = len;
+            k++;
+          }
+        for (int i = 0; i < n; i++) {
+          set_remove(&MY_SUBS, names[i], lens[i]);
+          ChannelEntry *ce = channels_get(&PUBSUB, names[i], lens[i]);
+          if (ce)
+            set_remove(&ce->subs, SUB_ID, SUB_ID_LEN);
+          fprintf(g_out, "+unsubscribe %.*s %d\r\n", lens[i], names[i],
+                  (int)MY_SUBS.count);
+          free(names[i]);
+        }
+        free(names);
+        free(lens);
+      }
+    } else {
+      for (int i = 1; i < argc; i++) {
+        if (set_get(&MY_SUBS, args[i].data, args[i].len)) {
+          set_remove(&MY_SUBS, args[i].data, args[i].len);
+          ChannelEntry *ce = channels_get(&PUBSUB, args[i].data, args[i].len);
+          if (ce)
+            set_remove(&ce->subs, SUB_ID, SUB_ID_LEN);
+        }
+        fprintf(g_out, "+unsubscribe %.*s %d\r\n", args[i].len, args[i].data,
+                (int)MY_SUBS.count);
+      }
+    }
+  } else if (strcmp(cmd, "PUBLISH") == 0) {
+    ChannelEntry *ce = channels_get(&PUBSUB, args[1].data, args[1].len);
+    int has_sub = ce && ce->subs.count > 0;
+    if (set_get(&MY_SUBS, args[1].data, args[1].len)) {
+      fprintf(g_out, "+message %.*s %.*s\r\n", args[1].len, args[1].data,
+              args[2].len, args[2].data);
+    }
+    resp_integer(has_sub ? 1 : 0);
   }
 }
 
@@ -1734,13 +1871,11 @@ typedef struct {
   Bulk *args;
   int argc;
 } QueuedCmd;
-
 typedef struct {
   int in_multi;
   QueuedCmd *cmds;
   int count, cap;
 } ClientState;
-
 static ClientState CLIENT = {0, NULL, 0, 0};
 
 static void free_queued_cmd(QueuedCmd *q) {
@@ -1772,13 +1907,11 @@ static void enqueue(Bulk args[], int argc) {
 }
 
 /* ============================================================
- * Top-level dispatcher: intercepts queuing for MULTI
+ * Top-level dispatcher
  * ============================================================ */
 static void handle_command(Bulk args[], int argc) {
   if (argc == 0)
     return;
-
-  /* Determine command name (uppercased) without allocating */
   char cmd[256];
   int cmdlen = args[0].len;
   if (cmdlen > (int)sizeof(cmd) - 1)
@@ -1853,7 +1986,6 @@ static void handle_command(Bulk args[], int argc) {
     return;
   }
 
-  /* Queue everything else if inside MULTI */
   if (CLIENT.in_multi) {
     enqueue(args, argc);
     resp_simple_string("QUEUED");
@@ -1868,6 +2000,7 @@ static void handle_command(Bulk args[], int argc) {
  * ============================================================ */
 int main(void) {
   g_out = stdout;
+  pubsub_init();
   hm_init(&DB, 1024);
   Reader r;
   reader_init(&r);
