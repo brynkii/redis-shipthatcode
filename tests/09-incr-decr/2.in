@@ -1,0 +1,3 @@
+INCR newkey
+INCRBY newkey 5
+DECRBY newkey 3

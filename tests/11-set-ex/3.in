@@ -1,0 +1,4 @@
+SET key val EX 10 NX
+GET key
+SET key newval EX 10 NX
+GET key

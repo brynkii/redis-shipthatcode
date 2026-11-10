@@ -1,0 +1,2 @@
+SET mykey hello
+EVAL "return redis.call('GET', KEYS[1])" 1 mykey

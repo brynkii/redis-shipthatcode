@@ -1,0 +1,9 @@
+MAXKEYS 3
+SET a 1
+SET b 2
+SET c 3
+WAIT 1000
+GET a
+SET d 4
+GET b
+GET a

@@ -1,0 +1,4 @@
+RPUSH mylist a
+RPUSH mylist b
+LPUSH mylist c
+LRANGE mylist 0 -1

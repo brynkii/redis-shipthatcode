@@ -1,0 +1,5 @@
+SET counter 10
+WATCH counter
+MULTI
+INCR counter
+EXEC

@@ -1,0 +1,5 @@
+AOF ON
+SET name Alice
+SET age 30
+GET name
+AOF DUMP

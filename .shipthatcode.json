@@ -1,0 +1,126 @@
+{
+  "course": "build-redis",
+  "language": "c",
+  "language_id": 1050,
+  "entrypoint": "main.c",
+  "version": 1,
+  "content_hash": "690cc9493ada5129",
+  "lessons": [
+    {
+      "slug": "ping",
+      "tests_hash": "74b47dc2ea54"
+    },
+    {
+      "slug": "echo",
+      "tests_hash": "83fa7687a986"
+    },
+    {
+      "slug": "resp-format",
+      "tests_hash": "c7b984eb7779"
+    },
+    {
+      "slug": "error-handling",
+      "tests_hash": "4c2fd886c6d5"
+    },
+    {
+      "slug": "resp-array-parsing",
+      "tests_hash": "8a8d0d796bf1"
+    },
+    {
+      "slug": "set-get",
+      "tests_hash": "e34aaefad462"
+    },
+    {
+      "slug": "multiple-keys",
+      "tests_hash": "4c6687847101"
+    },
+    {
+      "slug": "set-nx-xx",
+      "tests_hash": "3cfbcfdc28a6"
+    },
+    {
+      "slug": "incr-decr",
+      "tests_hash": "05895bc27704"
+    },
+    {
+      "slug": "expire-ttl",
+      "tests_hash": "80baac4aaea3"
+    },
+    {
+      "slug": "set-ex",
+      "tests_hash": "f9b7d7100590"
+    },
+    {
+      "slug": "passive-expiry",
+      "tests_hash": "05ebb58cbbc7"
+    },
+    {
+      "slug": "lpush-rpush",
+      "tests_hash": "c30295ce8335"
+    },
+    {
+      "slug": "lpop-rpop-llen",
+      "tests_hash": "8675c4eb141a"
+    },
+    {
+      "slug": "lrange",
+      "tests_hash": "0ace3481b5ba"
+    },
+    {
+      "slug": "hset-hget",
+      "tests_hash": "d5d31997e434"
+    },
+    {
+      "slug": "hdel-hgetall",
+      "tests_hash": "ff04ab57531c"
+    },
+    {
+      "slug": "sadd-smembers",
+      "tests_hash": "bcf1b4c118f4"
+    },
+    {
+      "slug": "zadd-zscore-zrange",
+      "tests_hash": "b2993332196b"
+    },
+    {
+      "slug": "del-exists-keys-type",
+      "tests_hash": "f9a776149716"
+    },
+    {
+      "slug": "multi-exec",
+      "tests_hash": "3f241b6be3d3"
+    },
+    {
+      "slug": "pub-sub",
+      "tests_hash": "00fe78c8d8d6"
+    },
+    {
+      "slug": "rdb-persistence",
+      "tests_hash": "6ac50c8347af"
+    },
+    {
+      "slug": "aof-logging",
+      "tests_hash": "d3ff0b679d2e"
+    },
+    {
+      "slug": "lru-eviction",
+      "tests_hash": "ba4f0eff5496"
+    },
+    {
+      "slug": "watch",
+      "tests_hash": "bfd3eaebe50b"
+    },
+    {
+      "slug": "eval-lua",
+      "tests_hash": "d4a5f2eba905"
+    },
+    {
+      "slug": "replication",
+      "tests_hash": "34e58aae8351"
+    },
+    {
+      "slug": "streams",
+      "tests_hash": "8d6a000a974e"
+    }
+  ]
+}

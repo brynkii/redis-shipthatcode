@@ -1,0 +1,4 @@
+ZADD leaderboard 100 alice 200 bob 150 charlie
+ZCARD leaderboard
+ZSCORE leaderboard bob
+ZRANK leaderboard alice

@@ -1,0 +1,4 @@
+SADD myset a b c
+SADD myset a
+SREM myset b
+SCARD myset

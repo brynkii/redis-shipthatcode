@@ -1,0 +1,2 @@
+SET foo bar
+LPUSH foo val

@@ -1,0 +1,6 @@
+SET key val
+TTL key
+EXPIRE key 5
+TTL key
+PERSIST key
+TTL key

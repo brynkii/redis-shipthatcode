@@ -1,0 +1,2 @@
+RESTORE "KEY string x hello"
+GET x

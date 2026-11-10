@@ -1,0 +1,4 @@
+SET key val NX
+GET key
+SET key val2 NX
+GET key

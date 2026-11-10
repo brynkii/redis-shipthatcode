@@ -1,0 +1,5 @@
+SET key val EX 5
+WAIT 3000
+GET key
+WAIT 3000
+GET key

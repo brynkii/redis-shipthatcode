@@ -1,0 +1,2 @@
+RPUSH mylist a b c
+LRANGE mylist -2 -1

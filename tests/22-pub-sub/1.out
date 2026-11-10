@@ -1,0 +1,4 @@
++subscribe news 1
++message news hello
+:1
++unsubscribe news 0

@@ -1,0 +1,3 @@
+SET key val EX 10
+TTL key
+GET key

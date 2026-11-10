@@ -1,0 +1,2 @@
+SET greeting "hello world"
+GET greeting

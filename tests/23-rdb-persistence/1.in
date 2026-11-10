@@ -1,0 +1,3 @@
+SET name Alice
+SET age 30
+SAVE

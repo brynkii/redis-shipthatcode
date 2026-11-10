@@ -1,0 +1,4 @@
+SET counter 10
+INCR counter
+INCR counter
+DECR counter

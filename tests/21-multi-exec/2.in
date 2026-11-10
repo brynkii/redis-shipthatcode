@@ -1,0 +1,4 @@
+MULTI
+SET a 1
+DISCARD
+GET a

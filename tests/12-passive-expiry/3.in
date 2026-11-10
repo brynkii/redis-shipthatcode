@@ -1,0 +1,5 @@
+SET key val EX 5
+WAIT 6000
+EXISTS key
+TTL key
+DBSIZE

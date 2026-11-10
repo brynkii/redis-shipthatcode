@@ -1,0 +1,4 @@
+SET key1 hello
+SET key2 world
+GET key1
+GET key2

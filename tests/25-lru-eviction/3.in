@@ -1,0 +1,4 @@
+MAXKEYS 2
+SET x 1
+SET y 2
+INFO memory

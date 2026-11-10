@@ -1,0 +1,3 @@
+SET key hello
+EXPIRE key 10
+TTL key

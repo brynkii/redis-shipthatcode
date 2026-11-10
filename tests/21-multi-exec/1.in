@@ -1,0 +1,4 @@
+MULTI
+SET foo bar
+GET foo
+EXEC

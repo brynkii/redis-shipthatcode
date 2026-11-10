@@ -1,0 +1,5 @@
+AOF ON
+SET key val
+DEL key
+AOF REPLAY
+GET key

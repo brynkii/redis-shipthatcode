@@ -1,0 +1,3 @@
+SUBSCRIBE news
+PUBLISH news hello
+UNSUBSCRIBE news

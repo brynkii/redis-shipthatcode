@@ -1,0 +1,5 @@
+RPUSH mylist a b c
+LLEN mylist
+LPOP mylist
+RPOP mylist
+LLEN mylist

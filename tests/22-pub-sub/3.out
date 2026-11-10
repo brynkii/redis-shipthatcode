@@ -1,0 +1,8 @@
++subscribe ch1 1
++subscribe ch2 2
++message ch1 msg1
+:1
++message ch2 msg2
+:1
++unsubscribe ch1 1
++unsubscribe ch2 0

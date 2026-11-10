@@ -1,0 +1,5 @@
+SET foo bar
+RPUSH mylist a
+TYPE foo
+TYPE mylist
+TYPE nonexistent

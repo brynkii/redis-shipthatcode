@@ -1,0 +1,4 @@
+SET key val XX
+SET key val
+SET key newval XX
+GET key

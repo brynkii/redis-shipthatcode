@@ -1,0 +1,3 @@
+XADD events * name Alice
+XADD events * name Bob
+XLEN events

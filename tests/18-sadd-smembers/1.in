@@ -1,0 +1,4 @@
+SADD myset a b c
+SCARD myset
+SISMEMBER myset a
+SISMEMBER myset z
