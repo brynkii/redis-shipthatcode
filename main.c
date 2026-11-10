@@ -54,6 +54,15 @@ void handle_command(char *args[], int argc) {
     fflush(stdout);
     return;
   }
+  if (strcmp(cmd, "ECHO") == 0) {
+    if (argc != 2) {
+      printf("-ERR wrong number of arguments for 'echo' command\r\n");
+    } else {
+      printf("$%d\r\n%s\r\n", (int)strlen(args[1]), args[1]);
+    }
+    fflush(stdout);
+    return;
+  }
 
   printf("-ERR unknown command\r\n");
   fflush(stdout);
