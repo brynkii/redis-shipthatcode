@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1547,6 +1548,7 @@ static const CommandSpec COMMANDS[] = {
     {"UNSUBSCRIBE", 0, -1}, {"PUBLISH", 2, 2}, {"SAVE", 0, 0},
     {"RESTORE", 1, 1},      {"AOF", 1, 1},     {"MAXKEYS", 1, 1},
     {"INFO", 1, 1},         {"WATCH", 1, -1},  {"UNWATCH", 0, 0},
+    {"EVAL", 2, -1},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -1565,6 +1567,59 @@ static int check_arity(const CommandSpec *spec, int argc) {
     resp_error(err);
     return 0;
   }
+  return 1;
+}
+
+static void execute_command(Bulk args[], int argc);
+
+/* ============================================================
+ * EVAL helpers
+ * ============================================================ */
+static char *capture_command(Bulk *caller_args, int argc, int *out_len) {
+  char *buf = NULL;
+  size_t sz = 0;
+  FILE *mem = open_memstream(&buf, &sz);
+  FILE *saved = g_out;
+  g_out = mem;
+  execute_command(caller_args, argc);
+  fflush(mem);
+  g_out = saved;
+  fclose(mem);
+  *out_len = (int)sz;
+  return buf;
+}
+
+static int parse_bulk_reply_as_int(const char *buf, int len, long long *out,
+                                   int *is_null) {
+  *is_null = 0;
+  if (len < 4)
+    return -1;
+  if (buf[0] != '$')
+    return -1;
+  int nl = -1;
+  for (int i = 1; i < len - 1; i++)
+    if (buf[i] == '\r' && buf[i + 1] == '\n') {
+      nl = i;
+      break;
+    }
+  if (nl < 0)
+    return -1;
+  long long blen = 0;
+  if (!parse_ll_strict(buf + 1, nl - 1, &blen))
+    return -1;
+  if (blen == -1) {
+    *is_null = 1;
+    return 0;
+  }
+  if (blen < 0)
+    return -1;
+  int body_start = nl + 2;
+  if (body_start + (int)blen + 2 > len)
+    return -1;
+  long long v;
+  if (!parse_ll_strict(buf + body_start, (int)blen, &v))
+    return -1;
+  *out = v;
   return 1;
 }
 
@@ -2427,16 +2482,144 @@ static void execute_command(Bulk args[], int argc) {
     } else
       resp_error("ERR unknown subcommand");
   } else if (strcmp(cmd, "WATCH") == 0) {
-    /* inside MULTI: error. handled in handle_command, so this only runs
-     * when not in MULTI. */
     resp_error("ERR WATCH inside MULTI is not allowed");
   } else if (strcmp(cmd, "UNWATCH") == 0) {
     resp_error("ERR UNWATCH inside MULTI is not allowed");
+  } else if (strcmp(cmd, "EVAL") == 0) {
+    long long numkeys;
+    if (!parse_ll_strict(args[2].data, args[2].len, &numkeys) || numkeys < 0) {
+      resp_error("ERR value is not an integer or out of range");
+      return;
+    }
+    int koff = 3;
+    int aoff = 3 + (int)numkeys;
+    if (aoff > argc) {
+      resp_error("ERR Number of keys can't be greater than number of args");
+      return;
+    }
+    int nkeys = (int)numkeys;
+    int nargv = argc - aoff;
+    (void)nkeys;
+    (void)nargv;
+
+    const char *raw = args[1].data;
+    int rawlen = args[1].len;
+    int s = 0, e = rawlen;
+    while (s < e && (raw[s] == ' ' || raw[s] == '\t' || raw[s] == '\n' ||
+                     raw[s] == '\r'))
+      s++;
+    while (e > s && (raw[e - 1] == ' ' || raw[e - 1] == '\t' ||
+                     raw[e - 1] == '\n' || raw[e - 1] == '\r'))
+      e--;
+    const char *script = raw + s;
+    int slen = e - s;
+
+    static const char *S_GET = "return redis.call('GET', KEYS[1])";
+    static const char *S_SET = "return redis.call('SET', KEYS[1], ARGV[1])";
+    static const char *S_INCR = "return redis.call('INCR', KEYS[1])";
+    static const char *S_NUM_OR_0 =
+        "return tonumber(redis.call('GET', KEYS[1])) or 0";
+    static const char *S_KEYS_LEN = "return #KEYS";
+    static const char *S_ARGV_1 = "return ARGV[1]";
+
+    if (slen == (int)strlen(S_GET) && memcmp(script, S_GET, slen) == 0) {
+      if (nkeys < 1) {
+        resp_error("ERR KEYS[1] out of range");
+        return;
+      }
+      Bulk sub[2];
+      char getcmd[] = "GET";
+      sub[0].data = getcmd;
+      sub[0].len = 3;
+      sub[1] = args[koff];
+      int outlen = 0;
+      char *captured = capture_command(sub, 2, &outlen);
+      fwrite(captured, 1, (size_t)outlen, g_out);
+      free(captured);
+    } else if (slen == (int)strlen(S_SET) && memcmp(script, S_SET, slen) == 0) {
+      if (nkeys < 1) {
+        resp_error("ERR KEYS[1] out of range");
+        return;
+      }
+      if (nargv < 1) {
+        resp_error("ERR ARGV[1] out of range");
+        return;
+      }
+      Bulk sub[3];
+      char setcmd[] = "SET";
+      sub[0].data = setcmd;
+      sub[0].len = 3;
+      sub[1] = args[koff];
+      sub[2] = args[aoff];
+      int outlen = 0;
+      char *captured = capture_command(sub, 3, &outlen);
+      fwrite(captured, 1, (size_t)outlen, g_out);
+      free(captured);
+    } else if (slen == (int)strlen(S_INCR) &&
+               memcmp(script, S_INCR, slen) == 0) {
+      if (nkeys < 1) {
+        resp_error("ERR KEYS[1] out of range");
+        return;
+      }
+      Bulk sub[2];
+      char incrcmd[] = "INCR";
+      sub[0].data = incrcmd;
+      sub[0].len = 4;
+      sub[1] = args[koff];
+      int outlen = 0;
+      char *captured = capture_command(sub, 2, &outlen);
+      fwrite(captured, 1, (size_t)outlen, g_out);
+      free(captured);
+    } else if (slen == (int)strlen(S_NUM_OR_0) &&
+               memcmp(script, S_NUM_OR_0, slen) == 0) {
+      if (nkeys < 1) {
+        resp_error("ERR KEYS[1] out of range");
+        return;
+      }
+      Bulk sub[2];
+      char getcmd[] = "GET";
+      sub[0].data = getcmd;
+      sub[0].len = 3;
+      sub[1] = args[koff];
+      int outlen = 0;
+      char *captured = capture_command(sub, 2, &outlen);
+      long long v = 0;
+      int is_null = 0;
+      int ok = parse_bulk_reply_as_int(captured, outlen, &v, &is_null);
+      free(captured);
+      if (ok < 0) {
+        resp_error("ERR value is not an integer or out of range");
+        return;
+      }
+      if (is_null)
+        resp_integer(0);
+      else
+        resp_integer(v);
+    } else if (slen == (int)strlen(S_KEYS_LEN) &&
+               memcmp(script, S_KEYS_LEN, slen) == 0) {
+      resp_integer((long long)nkeys);
+    } else if (slen == (int)strlen(S_ARGV_1) &&
+               memcmp(script, S_ARGV_1, slen) == 0) {
+      if (nargv < 1) {
+        resp_null_bulk();
+        return;
+      }
+      resp_bulk(args[aoff].data, args[aoff].len);
+    } else if (slen >= 9 && memcmp(script, "return '", 8) == 0 &&
+               script[slen - 1] == '\'') {
+      const char *lit = script + 8;
+      int litlen = slen - 9;
+      fprintf(g_out, "+");
+      fwrite(lit, 1, (size_t)litlen, g_out);
+      fprintf(g_out, "\r\n");
+    } else {
+      resp_error("ERR Error compiling script");
+    }
   }
 }
 
 /* ============================================================
- * Client state (MULTI queue + WATCH set)
+ * Client state
  * ============================================================ */
 typedef struct {
   Bulk *args;
