@@ -13,6 +13,13 @@ typedef struct {
 } Bulk;
 
 /* ============================================================
+ * Virtual clock (tests drive it via WAIT <ms>)
+ * ============================================================ */
+
+static long long virtual_now_ms = 0;
+static long long now_ms(void) { return virtual_now_ms; }
+
+/* ============================================================
  * Buffered reader over stdin (binary safe)
  * ============================================================ */
 
@@ -274,7 +281,7 @@ static void resp_bulk(const char *data, int len) {
 static void resp_null_bulk(void) { printf("$-1\r\n"); }
 
 /* ============================================================
- * In-memory hash map (binary-safe)
+ * In-memory hash map (binary-safe) + per-slot expiry
  * ============================================================ */
 
 typedef struct {
@@ -283,7 +290,9 @@ typedef struct {
   char *val;
   int vlen;
   int used;
+  long long expire_at_ms; /* 0 = no expiry (persists) */
 } Slot;
+
 typedef struct {
   Slot *slots;
   size_t cap, count;
@@ -357,6 +366,8 @@ static void hm_set(HashMap *m, const char *key, int klen, const char *val,
     m->slots[i].val = (char *)malloc((size_t)vlen);
     memcpy(m->slots[i].val, val, (size_t)vlen);
     m->slots[i].vlen = vlen;
+    /* plain SET clears any existing TTL (matches real Redis) */
+    m->slots[i].expire_at_ms = 0;
     return;
   }
   m->slots[i].used = 1;
@@ -366,7 +377,29 @@ static void hm_set(HashMap *m, const char *key, int klen, const char *val,
   m->slots[i].val = (char *)malloc((size_t)vlen);
   memcpy(m->slots[i].val, val, (size_t)vlen);
   m->slots[i].vlen = vlen;
+  m->slots[i].expire_at_ms = 0;
   m->count++;
+}
+
+/* Physically remove a key (free key/val, clear slot). Linear probing
+ * on open addressing makes this slightly delicate, but we defer this
+ * to the Passive Expiry lesson. For now, "delete on EXPIRE <= 0" is
+ * simulated by marking the slot as having an already-past deadline;
+ * TTL and future passive-expiry checks will then treat it as gone. */
+static void slot_mark_expired(Slot *s) {
+  if (!s)
+    return;
+  if (s->expire_at_ms == 0 || s->expire_at_ms > now_ms())
+    s->expire_at_ms = now_ms(); /* deadline in the past/now */
+}
+
+/* A slot is live if it exists and hasn't passed its deadline. */
+static int key_is_live(Slot *s) {
+  if (!s)
+    return 0;
+  if (s->expire_at_ms != 0 && now_ms() >= s->expire_at_ms)
+    return 0;
+  return 1;
 }
 
 static long hm_live_count(const HashMap *m) { return (long)m->count; }
@@ -374,11 +407,9 @@ static long hm_live_count(const HashMap *m) { return (long)m->count; }
 static HashMap DB;
 
 /* ============================================================
- * Integer parsing / arithmetic helpers
+ * Integer parsing helpers
  * ============================================================ */
 
-/* Strict base-10 signed 64-bit parse: optional +/- sign, then digits only.
- * Rejects "", "+", "-", "3.0", " 3", "0x10", and out-of-range. */
 static int parse_ll_strict(const char *s, int len, long long *out) {
   if (len <= 0)
     return 0;
@@ -402,21 +433,18 @@ static int parse_ll_strict(const char *s, int len, long long *out) {
   return 1;
 }
 
-/* Core INCR-family operation: key (args[key_idx]) += delta.
- * Missing key → current = 0. Writes back decimal, replies integer. */
 static void do_incr_by(Bulk args[], int key_idx, long long delta) {
   Bulk *key = &args[key_idx];
 
   long long current = 0;
   Slot *s = hm_get(&DB, key->data, key->len);
-  if (s) {
+  if (s && key_is_live(s)) {
     if (!parse_ll_strict(s->val, s->vlen, &current)) {
       resp_error("ERR value is not an integer or out of range");
       return;
     }
   }
 
-  /* overflow guard: current + delta must fit in int64 */
   if ((delta > 0 && current > LLONG_MAX - delta) ||
       (delta < 0 && current < LLONG_MIN - delta)) {
     resp_error("ERR increment or decrement would overflow");
@@ -441,9 +469,10 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1}, {"ECHO", 1, 1},   {"SET", 2, 4},
-    {"GET", 1, 1},  {"DBSIZE", 0, 0}, {"INCR", 1, 1},
-    {"DECR", 1, 1}, {"INCRBY", 2, 2}, {"DECRBY", 2, 2},
+    {"PING", 0, 1},   {"ECHO", 1, 1},   {"SET", 2, 4},  {"GET", 1, 1},
+    {"DBSIZE", 0, 0}, {"INCR", 1, 1},   {"DECR", 1, 1}, {"INCRBY", 2, 2},
+    {"DECRBY", 2, 2}, {"EXPIRE", 2, 2}, {"TTL", 1, 1},  {"PERSIST", 1, 1},
+    {"WAIT", 1, 1},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -525,7 +554,8 @@ static void handle_command(Bulk args[], int argc) {
     if (bad_flag || (nx && xx)) {
       resp_error("ERR syntax error");
     } else {
-      int exists = (hm_get(&DB, args[1].data, args[1].len) != NULL);
+      Slot *s = hm_get(&DB, args[1].data, args[1].len);
+      int exists = key_is_live(s);
       if ((nx && exists) || (xx && !exists)) {
         resp_null_bulk();
       } else {
@@ -535,7 +565,7 @@ static void handle_command(Bulk args[], int argc) {
     }
   } else if (strcmp(cmd, "GET") == 0) {
     Slot *s = hm_get(&DB, args[1].data, args[1].len);
-    if (s)
+    if (s && key_is_live(s))
       resp_bulk(s->val, s->vlen);
     else
       resp_null_bulk();
@@ -547,26 +577,73 @@ static void handle_command(Bulk args[], int argc) {
     do_incr_by(args, 1, -1);
   } else if (strcmp(cmd, "INCRBY") == 0) {
     long long delta;
-    if (!parse_ll_strict(args[2].data, args[2].len, &delta)) {
+    if (!parse_ll_strict(args[2].data, args[2].len, &delta))
       resp_error("ERR value is not an integer or out of range");
-    } else {
+    else
       do_incr_by(args, 1, delta);
-    }
   } else if (strcmp(cmd, "DECRBY") == 0) {
     long long delta;
-    if (!parse_ll_strict(args[2].data, args[2].len, &delta)) {
+    if (!parse_ll_strict(args[2].data, args[2].len, &delta))
       resp_error("ERR value is not an integer or out of range");
-    } else if (delta == LLONG_MIN) {
+    else if (delta == LLONG_MIN)
       resp_error("ERR increment or decrement would overflow");
-    } else {
+    else
       do_incr_by(args, 1, -delta);
+  } else if (strcmp(cmd, "EXPIRE") == 0) {
+    long long secs;
+    if (!parse_ll_strict(args[2].data, args[2].len, &secs)) {
+      resp_error("ERR value is not an integer or out of range");
+    } else {
+      Slot *s = hm_get(&DB, args[1].data, args[1].len);
+      if (!s) {
+        resp_integer(0); /* key absent */
+      } else if (secs <= 0) {
+        /* real Redis: EXPIRE <= 0 deletes immediately, returns 1 */
+        slot_mark_expired(s);
+        resp_integer(1);
+      } else {
+        s->expire_at_ms = now_ms() + secs * 1000LL;
+        resp_integer(1);
+      }
+    }
+  } else if (strcmp(cmd, "TTL") == 0) {
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s) {
+      resp_integer(-2); /* key doesn't exist */
+    } else if (s->expire_at_ms == 0) {
+      resp_integer(-1); /* exists, no expiry */
+    } else {
+      long long remaining_ms = s->expire_at_ms - now_ms();
+      if (remaining_ms <= 0) {
+        resp_integer(-2); /* already expired */
+      } else {
+        /* round-to-nearest, matching Python's round() on seconds */
+        long long secs = (remaining_ms + 500) / 1000;
+        resp_integer(secs);
+      }
+    }
+  } else if (strcmp(cmd, "PERSIST") == 0) {
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s || s->expire_at_ms == 0) {
+      resp_integer(0);
+    } else {
+      s->expire_at_ms = 0;
+      resp_integer(1);
+    }
+  } else if (strcmp(cmd, "WAIT") == 0) {
+    long long ms;
+    if (!parse_ll_strict(args[1].data, args[1].len, &ms) || ms < 0) {
+      resp_error("ERR value is not an integer or out of range");
+    } else {
+      virtual_now_ms += ms;
+      resp_simple_string("OK");
     }
   }
   fflush(stdout);
 }
 
 /* ============================================================
- * Main: auto-detect RESP array vs text line
+ * Main
  * ============================================================ */
 
 int main(void) {
