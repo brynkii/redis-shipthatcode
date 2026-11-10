@@ -953,7 +953,7 @@ static long long MAXKEYS = 0;
 static uint64_t access_seq_counter = 0;
 
 /* ============================================================
- * Version map (per-key, survives DEL)
+ * Version map
  * ============================================================ */
 typedef struct {
   char *key;
@@ -1279,7 +1279,7 @@ static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
 }
 
 /* ============================================================
- * RDB SAVE / RESTORE helpers
+ * RDB SAVE / RESTORE
  * ============================================================ */
 static int cmp_key_bytes(const void *a, const void *b) {
   const Bulk *ka = (const Bulk *)a;
@@ -1294,20 +1294,20 @@ static int cmp_key_bytes(const void *a, const void *b) {
     return 1;
   return 0;
 }
-static void save_emit(Slot *s) {
-  fprintf(g_out, "KEY %s ", type_name(s->type));
-  fwrite(s->key, 1, (size_t)s->klen, g_out);
-  fprintf(g_out, " ");
+static void save_emit_to(FILE *out, Slot *s) {
+  fprintf(out, "KEY %s ", type_name(s->type));
+  fwrite(s->key, 1, (size_t)s->klen, out);
+  fprintf(out, " ");
   switch (s->type) {
   case T_STR:
-    fwrite(s->val, 1, (size_t)s->vlen, g_out);
+    fwrite(s->val, 1, (size_t)s->vlen, out);
     break;
   case T_LIST: {
     int first = 1;
     for (ListNode *n = s->list.head; n; n = n->next) {
       if (!first)
-        fputc(',', g_out);
-      fwrite(n->data, 1, (size_t)n->len, g_out);
+        fputc(',', out);
+      fwrite(n->data, 1, (size_t)n->len, out);
       first = 0;
     }
     break;
@@ -1323,10 +1323,10 @@ static void save_emit(Slot *s) {
     qsort(fields, (size_t)live, sizeof(HashField *), cmp_hash_seq);
     for (int i = 0; i < live; i++) {
       if (i > 0)
-        fputc(',', g_out);
-      fwrite(fields[i]->field, 1, (size_t)fields[i]->flen, g_out);
-      fputc('=', g_out);
-      fwrite(fields[i]->value, 1, (size_t)fields[i]->vlen, g_out);
+        fputc(',', out);
+      fwrite(fields[i]->field, 1, (size_t)fields[i]->flen, out);
+      fputc('=', out);
+      fwrite(fields[i]->value, 1, (size_t)fields[i]->vlen, out);
     }
     free(fields);
     break;
@@ -1336,8 +1336,8 @@ static void save_emit(Slot *s) {
     for (size_t i = 0; i < s->set.cap; i++)
       if (s->set.entries[i].used == 1) {
         if (!first)
-          fputc(',', g_out);
-        fwrite(s->set.entries[i].data, 1, (size_t)s->set.entries[i].len, g_out);
+          fputc(',', out);
+        fwrite(s->set.entries[i].data, 1, (size_t)s->set.entries[i].len, out);
         first = 0;
       }
     break;
@@ -1347,19 +1347,21 @@ static void save_emit(Slot *s) {
     ZSetEntry **sorted = zset_sorted(&s->zset, &n);
     for (int i = 0; i < n; i++) {
       if (i > 0)
-        fputc(',', g_out);
-      fwrite(sorted[i]->member, 1, (size_t)sorted[i]->mlen, g_out);
-      fputc('=', g_out);
+        fputc(',', out);
+      fwrite(sorted[i]->member, 1, (size_t)sorted[i]->mlen, out);
+      fputc('=', out);
       char sbuf[64];
       format_score(sorted[i]->score, sbuf, sizeof(sbuf));
-      fprintf(g_out, "%s", sbuf);
+      fprintf(out, "%s", sbuf);
     }
     free(sorted);
     break;
   }
   }
-  fprintf(g_out, "\r\n");
+  fprintf(out, "\r\n");
 }
+static void save_emit(Slot *s) { save_emit_to(g_out, s); }
+
 static void restore_line(const char *line, int len) {
   if (len <= 0)
     return;
@@ -1521,6 +1523,40 @@ static void aof_append(Bulk args[], int argc) {
 }
 
 /* ============================================================
+ * Replication state
+ * ============================================================ */
+typedef struct {
+  char *line;
+  int len;
+} ReplEntry;
+typedef struct {
+  ReplEntry *entries;
+  int count, cap;
+} ReplBacklog;
+static ReplBacklog BACKLOG = {NULL, 0, 0};
+
+static const char *REPLID = "abc0000000000000000000000000000000000000";
+static const int REPLID_LEN = 40;
+
+static int IS_MASTER = 1;
+static char MASTER_HOST[256] = {0};
+static int MASTER_PORT = 0;
+
+static void backlog_append(Bulk args[], int argc) {
+  char *line;
+  int len;
+  aof_serialize(args, argc, &line, &len);
+  if (BACKLOG.count >= BACKLOG.cap) {
+    BACKLOG.cap = BACKLOG.cap ? BACKLOG.cap * 2 : 16;
+    BACKLOG.entries =
+        realloc(BACKLOG.entries, sizeof(ReplEntry) * (size_t)BACKLOG.cap);
+  }
+  BACKLOG.entries[BACKLOG.count].line = line;
+  BACKLOG.entries[BACKLOG.count].len = len;
+  BACKLOG.count++;
+}
+
+/* ============================================================
  * Command table
  * ============================================================ */
 typedef struct {
@@ -1530,25 +1566,36 @@ typedef struct {
 } CommandSpec;
 
 static const CommandSpec COMMANDS[] = {
-    {"PING", 0, 1},         {"ECHO", 1, 1},    {"SET", 2, 6},
-    {"GET", 1, 1},          {"DEL", 1, -1},    {"EXISTS", 1, -1},
-    {"KEYS", 1, 1},         {"TYPE", 1, 1},    {"RENAME", 2, 2},
-    {"DBSIZE", 0, 0},       {"INCR", 1, 1},    {"DECR", 1, 1},
-    {"INCRBY", 2, 2},       {"DECRBY", 2, 2},  {"EXPIRE", 2, 2},
-    {"TTL", 1, 1},          {"PTTL", 1, 1},    {"PERSIST", 1, 1},
-    {"WAIT", 1, 1},         {"LPUSH", 2, -1},  {"RPUSH", 2, -1},
-    {"LRANGE", 3, 3},       {"LPOP", 1, 1},    {"RPOP", 1, 1},
-    {"LLEN", 1, 1},         {"HSET", 3, -1},   {"HGET", 2, 2},
-    {"HDEL", 2, -1},        {"HGETALL", 1, 1}, {"HEXISTS", 2, 2},
-    {"HLEN", 1, 1},         {"SADD", 2, -1},   {"SMEMBERS", 1, 1},
-    {"SISMEMBER", 2, 2},    {"SCARD", 1, 1},   {"SREM", 2, -1},
-    {"ZADD", 3, -1},        {"ZSCORE", 2, 2},  {"ZRANGE", 3, 4},
-    {"ZRANK", 2, 2},        {"ZCARD", 1, 1},   {"MULTI", 0, 0},
-    {"EXEC", 0, 0},         {"DISCARD", 0, 0}, {"SUBSCRIBE", 1, -1},
-    {"UNSUBSCRIBE", 0, -1}, {"PUBLISH", 2, 2}, {"SAVE", 0, 0},
-    {"RESTORE", 1, 1},      {"AOF", 1, 1},     {"MAXKEYS", 1, 1},
-    {"INFO", 1, 1},         {"WATCH", 1, -1},  {"UNWATCH", 0, 0},
-    {"EVAL", 2, -1},
+    {"PING", 0, 1},       {"ECHO", 1, 1},
+    {"SET", 2, 6},        {"GET", 1, 1},
+    {"DEL", 1, -1},       {"EXISTS", 1, -1},
+    {"KEYS", 1, 1},       {"TYPE", 1, 1},
+    {"RENAME", 2, 2},     {"DBSIZE", 0, 0},
+    {"INCR", 1, 1},       {"DECR", 1, 1},
+    {"INCRBY", 2, 2},     {"DECRBY", 2, 2},
+    {"EXPIRE", 2, 2},     {"TTL", 1, 1},
+    {"PTTL", 1, 1},       {"PERSIST", 1, 1},
+    {"WAIT", 1, 1},       {"LPUSH", 2, -1},
+    {"RPUSH", 2, -1},     {"LRANGE", 3, 3},
+    {"LPOP", 1, 1},       {"RPOP", 1, 1},
+    {"LLEN", 1, 1},       {"HSET", 3, -1},
+    {"HGET", 2, 2},       {"HDEL", 2, -1},
+    {"HGETALL", 1, 1},    {"HEXISTS", 2, 2},
+    {"HLEN", 1, 1},       {"SADD", 2, -1},
+    {"SMEMBERS", 1, 1},   {"SISMEMBER", 2, 2},
+    {"SCARD", 1, 1},      {"SREM", 2, -1},
+    {"ZADD", 3, -1},      {"ZSCORE", 2, 2},
+    {"ZRANGE", 3, 4},     {"ZRANK", 2, 2},
+    {"ZCARD", 1, 1},      {"MULTI", 0, 0},
+    {"EXEC", 0, 0},       {"DISCARD", 0, 0},
+    {"SUBSCRIBE", 1, -1}, {"UNSUBSCRIBE", 0, -1},
+    {"PUBLISH", 2, 2},    {"SAVE", 0, 0},
+    {"RESTORE", 1, 1},    {"AOF", 1, 1},
+    {"MAXKEYS", 1, 1},    {"INFO", 1, 1},
+    {"WATCH", 1, -1},     {"UNWATCH", 0, 0},
+    {"EVAL", 2, -1},      {"REPLICAOF", 2, 2},
+    {"ROLE", 0, 0},       {"REPLICATION_LOG", 0, 0},
+    {"PSYNC", 2, 2},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -2615,6 +2662,111 @@ static void execute_command(Bulk args[], int argc) {
     } else {
       resp_error("ERR Error compiling script");
     }
+  } else if (strcmp(cmd, "REPLICAOF") == 0) {
+    char a1[16];
+    int l1 = args[1].len;
+    if (l1 > 15)
+      l1 = 15;
+    memcpy(a1, args[1].data, (size_t)l1);
+    a1[l1] = '\0';
+    for (int i = 0; i < l1; i++)
+      a1[i] = (char)toupper((unsigned char)a1[i]);
+    char a2[16];
+    int l2 = args[2].len;
+    if (l2 > 15)
+      l2 = 15;
+    memcpy(a2, args[2].data, (size_t)l2);
+    a2[l2] = '\0';
+    for (int i = 0; i < l2; i++)
+      a2[i] = (char)toupper((unsigned char)a2[i]);
+    if (strcmp(a1, "NO") == 0 && strcmp(a2, "ONE") == 0) {
+      IS_MASTER = 1;
+      MASTER_HOST[0] = '\0';
+      MASTER_PORT = 0;
+      resp_simple_string("OK");
+    } else {
+      IS_MASTER = 0;
+      int hl = args[1].len;
+      if (hl > 255)
+        hl = 255;
+      memcpy(MASTER_HOST, args[1].data, (size_t)hl);
+      MASTER_HOST[hl] = '\0';
+      long long port = 0;
+      if (parse_ll_strict(args[2].data, args[2].len, &port))
+        MASTER_PORT = (int)port;
+      resp_simple_string("OK");
+    }
+  } else if (strcmp(cmd, "ROLE") == 0) {
+    if (IS_MASTER)
+      resp_bulk("master", 6);
+    else
+      resp_bulk("replica", 7);
+  } else if (strcmp(cmd, "REPLICATION_LOG") == 0) {
+    for (int i = 0; i < BACKLOG.count; i++)
+      resp_bulk(BACKLOG.entries[i].line, BACKLOG.entries[i].len);
+    resp_simple_string("OK");
+  } else if (strcmp(cmd, "PSYNC") == 0) {
+    int is_full = (args[1].len == 1 && args[1].data[0] == '?');
+    long long offset = 0;
+    if (!is_full) {
+      if (!parse_ll_strict(args[2].data, args[2].len, &offset) || offset < 0)
+        is_full = 1;
+      else if (args[1].len != REPLID_LEN ||
+               memcmp(args[1].data, REPLID, (size_t)REPLID_LEN) != 0)
+        is_full = 1;
+    }
+
+    if (is_full) {
+      fprintf(g_out, "+FULLRESYNC %s 0\r\n", REPLID);
+
+      char *snap_buf = NULL;
+      size_t snap_sz = 0;
+      FILE *snap = open_memstream(&snap_buf, &snap_sz);
+      int total = (int)hm_live_count(&DB);
+      if (total > 0) {
+        Bulk *keys = malloc(sizeof(Bulk) * (size_t)total);
+        int k = 0;
+        for (size_t i = 0; i < DB.cap; i++)
+          if (DB.slots[i].used == 1 &&
+              !(DB.slots[i].expire_at_ms != 0 &&
+                now_ms() >= DB.slots[i].expire_at_ms)) {
+            keys[k].data = DB.slots[i].key;
+            keys[k].len = DB.slots[i].klen;
+            k++;
+          }
+        qsort(keys, (size_t)total, sizeof(Bulk), cmp_key_bytes);
+        for (int i = 0; i < total; i++) {
+          Slot *s = hm_get(&DB, keys[i].data, keys[i].len);
+          if (s)
+            save_emit_to(snap, s);
+        }
+        free(keys);
+      }
+      fclose(snap);
+      resp_bulk(snap_buf, (int)snap_sz);
+      free(snap_buf);
+
+      char *bl_buf = NULL;
+      size_t bl_sz = 0;
+      FILE *bl = open_memstream(&bl_buf, &bl_sz);
+      for (int i = 0; i < BACKLOG.count; i++)
+        fprintf(bl, "%.*s\r\n", BACKLOG.entries[i].len,
+                BACKLOG.entries[i].line);
+      fclose(bl);
+      resp_bulk(bl_buf, (int)bl_sz);
+      free(bl_buf);
+    } else {
+      fprintf(g_out, "+CONTINUE\r\n");
+      char *bl_buf = NULL;
+      size_t bl_sz = 0;
+      FILE *bl = open_memstream(&bl_buf, &bl_sz);
+      for (long i = offset; i < BACKLOG.count; i++)
+        fprintf(bl, "%.*s\r\n", BACKLOG.entries[i].len,
+                BACKLOG.entries[i].line);
+      fclose(bl);
+      resp_bulk(bl_buf, (int)bl_sz);
+      free(bl_buf);
+    }
   }
 }
 
@@ -2823,8 +2975,11 @@ static void handle_command(Bulk args[], int argc) {
     return;
   }
 
-  if (AOF.enabled && is_write_command(cmd))
-    aof_append(args, argc);
+  if (is_write_command(cmd)) {
+    backlog_append(args, argc);
+    if (AOF.enabled)
+      aof_append(args, argc);
+  }
   execute_command(args, argc);
 }
 
@@ -2872,6 +3027,9 @@ int main(void) {
   for (int i = 0; i < AOF.count; i++)
     free(AOF.entries[i].line);
   free(AOF.entries);
+  for (int i = 0; i < BACKLOG.count; i++)
+    free(BACKLOG.entries[i].line);
+  free(BACKLOG.entries);
   reader_free(&r);
   hm_free(&DB);
   return 0;
