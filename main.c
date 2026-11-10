@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
 #include <limits.h>
-#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -612,6 +611,22 @@ static ZSetEntry **zset_sorted(const ZSet *z, int *out_n) {
 }
 
 /* ============================================================
+ * Stream types
+ * ============================================================ */
+typedef struct {
+  char *id;
+  char **fields;
+  int *flens;
+  int nfields;
+} StreamEntry;
+typedef struct {
+  StreamEntry *entries;
+  size_t count, cap;
+  long long last_ms;
+  long long last_seq;
+} Stream;
+
+/* ============================================================
  * Pub/Sub state
  * ============================================================ */
 typedef struct {
@@ -699,7 +714,8 @@ typedef enum {
   T_LIST = 2,
   T_HASH = 3,
   T_SET = 4,
-  T_ZSET = 5
+  T_ZSET = 5,
+  T_STREAM = 6
 } ValueType;
 typedef struct ListNode {
   char *data;
@@ -725,12 +741,28 @@ typedef struct {
   Hash hash;
   Set set;
   ZSet zset;
+  Stream stream;
 } Slot;
 
 typedef struct {
   Slot *slots;
   size_t cap, count;
 } HashMap;
+
+static void stream_clear(Stream *s) {
+  for (size_t i = 0; i < s->count; i++) {
+    free(s->entries[i].id);
+    for (int j = 0; j < s->entries[i].nfields; j++)
+      free(s->entries[i].fields[j]);
+    free(s->entries[i].fields);
+    free(s->entries[i].flens);
+  }
+  free(s->entries);
+  s->entries = NULL;
+  s->count = s->cap = 0;
+  s->last_ms = 0;
+  s->last_seq = 0;
+}
 
 static void list_free(List *l) {
   ListNode *n = l->head;
@@ -755,6 +787,8 @@ static void slot_clear(Slot *s) {
     set_free(&s->set);
   else if (s->type == T_ZSET)
     zset_free(&s->zset);
+  else if (s->type == T_STREAM)
+    stream_clear(&s->stream);
   else {
     free(s->val);
     s->val = NULL;
@@ -828,6 +862,8 @@ static void hm_set_str(HashMap *m, const char *key, int klen, const char *val,
       set_free(&m->slots[i].set);
     else if (m->slots[i].type == T_ZSET)
       zset_free(&m->slots[i].zset);
+    else if (m->slots[i].type == T_STREAM)
+      stream_clear(&m->slots[i].stream);
     else
       free(m->slots[i].val);
     m->slots[i].type = T_STR;
@@ -947,6 +983,33 @@ static void hm_set_zset(HashMap *m, const char *key, int klen,
   m->slots[i].access_seq = 0;
   m->count++;
 }
+static void hm_set_stream(HashMap *m, const char *key, int klen,
+                          long long expire_at_ms) {
+  if ((m->count + 1) * 10 >= m->cap * 7)
+    hm_grow(m);
+  size_t i = hm_find_slot(m, key, klen);
+  if (m->slots[i].used == 1) {
+    m->slots[i].expire_at_ms = expire_at_ms;
+    return;
+  }
+  m->slots[i].used = 1;
+  m->slots[i].key = malloc((size_t)klen);
+  memcpy(m->slots[i].key, key, (size_t)klen);
+  m->slots[i].klen = klen;
+  m->slots[i].type = T_STREAM;
+  m->slots[i].val = NULL;
+  m->slots[i].vlen = 0;
+  m->slots[i].expire_at_ms = expire_at_ms;
+  m->slots[i].list.head = m->slots[i].list.tail = NULL;
+  m->slots[i].list.len = 0;
+  m->slots[i].stream.entries = NULL;
+  m->slots[i].stream.count = m->slots[i].stream.cap = 0;
+  m->slots[i].stream.last_ms = 0;
+  m->slots[i].stream.last_seq = 0;
+  m->slots[i].access_time = 0;
+  m->slots[i].access_seq = 0;
+  m->count++;
+}
 
 static HashMap DB;
 static long long MAXKEYS = 0;
@@ -1023,7 +1086,7 @@ static void ver_bump(const char *key, int klen) {
 }
 
 /* ============================================================
- * Access-time helpers
+ * Store-level helpers
  * ============================================================ */
 static int expire_if_needed_impl(const char *key, int klen) {
   Slot *s = hm_get(&DB, key, klen);
@@ -1055,6 +1118,8 @@ static const char *type_name(ValueType t) {
     return "set";
   case T_ZSET:
     return "zset";
+  case T_STREAM:
+    return "stream";
   default:
     return "string";
   }
@@ -1257,6 +1322,10 @@ static int hm_rename(const char *src, int slen, const char *dst, int dlen) {
   s->set.cap = s->set.count = 0;
   s->zset.entries = NULL;
   s->zset.cap = s->zset.count = 0;
+  s->stream.entries = NULL;
+  s->stream.cap = s->stream.count = 0;
+  s->stream.last_ms = 0;
+  s->stream.last_seq = 0;
   s->expire_at_ms = 0;
   s->type = T_STR;
   s->used = 2;
@@ -1357,6 +1426,8 @@ static void save_emit_to(FILE *out, Slot *s) {
     free(sorted);
     break;
   }
+  default:
+    break;
   }
   fprintf(out, "\r\n");
 }
@@ -1473,10 +1544,10 @@ typedef struct {
 static AofLog AOF = {0, NULL, 0, 0};
 
 static int is_write_command(const char *upper_cmd) {
-  static const char *writes[] = {"SET",  "DEL",    "LPUSH",  "RPUSH",   "LPOP",
-                                 "RPOP", "HSET",   "HDEL",   "SADD",    "SREM",
-                                 "ZADD", "EXPIRE", "RENAME", "RESTORE", "INCR",
-                                 "DECR", "INCRBY", "DECRBY", "PERSIST", NULL};
+  static const char *writes[] = {
+      "SET",  "DEL",  "LPUSH",  "RPUSH",  "LPOP",    "RPOP",   "HSET",
+      "HDEL", "SADD", "SREM",   "ZADD",   "EXPIRE",  "RENAME", "RESTORE",
+      "INCR", "DECR", "INCRBY", "DECRBY", "PERSIST", "XADD",   NULL};
   for (int i = 0; writes[i]; i++)
     if (strcmp(writes[i], upper_cmd) == 0)
       return 1;
@@ -1557,6 +1628,54 @@ static void backlog_append(Bulk args[], int argc) {
 }
 
 /* ============================================================
+ * Stream helpers
+ * ============================================================ */
+static int parse_stream_id(const char *s, int len, long long *ms,
+                           long long *seq) {
+  int dash = -1;
+  for (int i = 0; i < len; i++)
+    if (s[i] == '-') {
+      dash = i;
+      break;
+    }
+  if (dash < 0)
+    return 0;
+  if (!parse_ll_strict(s, dash, ms))
+    return 0;
+  if (!parse_ll_strict(s + dash + 1, len - dash - 1, seq))
+    return 0;
+  if (*ms < 0 || *seq < 0)
+    return 0;
+  return 1;
+}
+static int stream_id_greater(long long a_ms, long long a_seq, long long b_ms,
+                             long long b_seq) {
+  if (a_ms != b_ms)
+    return a_ms > b_ms;
+  return a_seq > b_seq;
+}
+static void stream_append(Stream *st, const char *id, int idlen, Bulk *fields,
+                          int nfields) {
+  if (st->count >= st->cap) {
+    st->cap = st->cap ? st->cap * 2 : 8;
+    st->entries = realloc(st->entries, sizeof(StreamEntry) * st->cap);
+  }
+  StreamEntry *e = &st->entries[st->count];
+  e->id = malloc((size_t)idlen + 1);
+  memcpy(e->id, id, (size_t)idlen);
+  e->id[idlen] = '\0';
+  e->nfields = nfields;
+  e->fields = malloc(sizeof(char *) * (size_t)nfields);
+  e->flens = malloc(sizeof(int) * (size_t)nfields);
+  for (int i = 0; i < nfields; i++) {
+    e->fields[i] = malloc((size_t)fields[i].len);
+    memcpy(e->fields[i], fields[i].data, (size_t)fields[i].len);
+    e->flens[i] = fields[i].len;
+  }
+  st->count++;
+}
+
+/* ============================================================
  * Command table
  * ============================================================ */
 typedef struct {
@@ -1595,7 +1714,9 @@ static const CommandSpec COMMANDS[] = {
     {"WATCH", 1, -1},     {"UNWATCH", 0, 0},
     {"EVAL", 2, -1},      {"REPLICAOF", 2, 2},
     {"ROLE", 0, 0},       {"REPLICATION_LOG", 0, 0},
-    {"PSYNC", 2, 2},
+    {"PSYNC", 2, 2},      {"XADD", 4, -1},
+    {"XLEN", 1, 1},       {"XRANGE", 3, 3},
+    {"XREAD", 4, -1},
 };
 static const int NUM_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
 
@@ -1635,7 +1756,6 @@ static char *capture_command(Bulk *caller_args, int argc, int *out_len) {
   *out_len = (int)sz;
   return buf;
 }
-
 static int parse_bulk_reply_as_int(const char *buf, int len, long long *out,
                                    int *is_null) {
   *is_null = 0;
@@ -2422,7 +2542,7 @@ static void execute_command(Bulk args[], int argc) {
       qsort(keys, (size_t)total, sizeof(Bulk), cmp_key_bytes);
       for (int i = 0; i < total; i++) {
         Slot *s = hm_get(&DB, keys[i].data, keys[i].len);
-        if (s)
+        if (s && s->type != T_STREAM)
           save_emit(s);
       }
       free(keys);
@@ -2737,7 +2857,7 @@ static void execute_command(Bulk args[], int argc) {
         qsort(keys, (size_t)total, sizeof(Bulk), cmp_key_bytes);
         for (int i = 0; i < total; i++) {
           Slot *s = hm_get(&DB, keys[i].data, keys[i].len);
-          if (s)
+          if (s && s->type != T_STREAM)
             save_emit_to(snap, s);
         }
         free(keys);
@@ -2766,6 +2886,271 @@ static void execute_command(Bulk args[], int argc) {
       fclose(bl);
       resp_bulk(bl_buf, (int)bl_sz);
       free(bl_buf);
+    }
+  } else if (strcmp(cmd, "XADD") == 0) {
+    int nfields = argc - 3;
+    if (nfields < 2 || nfields % 2 != 0) {
+      resp_error("ERR wrong number of arguments for 'xadd' command");
+      return;
+    }
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (s && s->type != T_STREAM) {
+      resp_error(WRONGTYPE_MSG);
+      return;
+    }
+    if (!s) {
+      make_room_for_new_key();
+      hm_set_stream(&DB, args[1].data, args[1].len, 0);
+      s = hm_get(&DB, args[1].data, args[1].len);
+    }
+
+    int is_auto = (args[2].len == 1 && args[2].data[0] == '*');
+    long long new_ms = 0, new_seq = 0;
+    char idbuf[64];
+    int idlen = 0;
+
+    if (is_auto) {
+      new_ms = s->stream.last_ms + 1;
+      new_seq = 0;
+      idlen = snprintf(idbuf, sizeof(idbuf), "%lld-%lld", new_ms, new_seq);
+    } else {
+      if (!parse_stream_id(args[2].data, args[2].len, &new_ms, &new_seq)) {
+        resp_error(
+            "ERR Invalid stream ID specified as stream command argument");
+        return;
+      }
+      if (s->stream.count > 0 &&
+          !stream_id_greater(new_ms, new_seq, s->stream.last_ms,
+                             s->stream.last_seq)) {
+        resp_error("ERR The ID specified in XADD is equal or smaller than the "
+                   "target stream top item");
+        return;
+      }
+      idlen = args[2].len;
+      memcpy(idbuf, args[2].data, (size_t)idlen);
+      idbuf[idlen] = '\0';
+    }
+
+    stream_append(&s->stream, idbuf, idlen, &args[3], nfields);
+    s->stream.last_ms = new_ms;
+    s->stream.last_seq = new_seq;
+    touch_slot(s);
+    ver_bump(args[1].data, args[1].len);
+    resp_bulk(idbuf, idlen);
+  } else if (strcmp(cmd, "XLEN") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s)
+      resp_integer(0);
+    else if (s->type != T_STREAM)
+      resp_error(WRONGTYPE_MSG);
+    else {
+      touch_slot(s);
+      resp_integer((long long)s->stream.count);
+    }
+  } else if (strcmp(cmd, "XRANGE") == 0) {
+    expire_if_needed_impl(args[1].data, args[1].len);
+    Slot *s = hm_get(&DB, args[1].data, args[1].len);
+    if (!s) {
+      resp_array_header(0);
+      return;
+    }
+    if (s->type != T_STREAM) {
+      resp_error(WRONGTYPE_MSG);
+      return;
+    }
+    touch_slot(s);
+
+    long long start_ms, start_seq;
+    int start_neg_inf = (args[2].len == 1 && args[2].data[0] == '-');
+    if (!start_neg_inf) {
+      if (!parse_stream_id(args[2].data, args[2].len, &start_ms, &start_seq)) {
+        resp_error(
+            "ERR Invalid stream ID specified as stream command argument");
+        return;
+      }
+    } else {
+      start_ms = 0;
+      start_seq = 0;
+    }
+
+    long long end_ms, end_seq;
+    int end_pos_inf = (args[3].len == 1 && args[3].data[0] == '+');
+    if (!end_pos_inf) {
+      if (!parse_stream_id(args[3].data, args[3].len, &end_ms, &end_seq)) {
+        resp_error(
+            "ERR Invalid stream ID specified as stream command argument");
+        return;
+      }
+    } else {
+      end_ms = LLONG_MAX;
+      end_seq = LLONG_MAX;
+    }
+
+    int count = 0;
+    for (size_t i = 0; i < s->stream.count; i++) {
+      long long em, es;
+      if (!parse_stream_id(s->stream.entries[i].id,
+                           (int)strlen(s->stream.entries[i].id), &em, &es))
+        continue;
+      int ge_start = (em > start_ms) || (em == start_ms && es >= start_seq);
+      int le_end = (em < end_ms) || (em == end_ms && es <= end_seq);
+      if (ge_start && le_end)
+        count++;
+    }
+    resp_array_header(count);
+    for (size_t i = 0; i < s->stream.count; i++) {
+      long long em, es;
+      if (!parse_stream_id(s->stream.entries[i].id,
+                           (int)strlen(s->stream.entries[i].id), &em, &es))
+        continue;
+      int ge_start = (em > start_ms) || (em == start_ms && es >= start_seq);
+      int le_end = (em < end_ms) || (em == end_ms && es <= end_seq);
+      if (!(ge_start && le_end))
+        continue;
+
+      resp_array_header(2);
+      resp_bulk(s->stream.entries[i].id, (int)strlen(s->stream.entries[i].id));
+      resp_array_header(s->stream.entries[i].nfields);
+      for (int j = 0; j < s->stream.entries[i].nfields; j++)
+        resp_bulk(s->stream.entries[i].fields[j],
+                  s->stream.entries[i].flens[j]);
+    }
+  } else if (strcmp(cmd, "XREAD") == 0) {
+    long long count = LLONG_MAX;
+    int streams_idx = -1;
+    for (int i = 1; i < argc; i++) {
+      if (args[i].len == 5) {
+        char f[8];
+        memcpy(f, args[i].data, 5);
+        f[5] = '\0';
+        for (int k = 0; k < 5; k++)
+          f[k] = (char)toupper((unsigned char)f[k]);
+        if (strcmp(f, "COUNT") == 0 && i + 1 < argc) {
+          if (!parse_ll_strict(args[i + 1].data, args[i + 1].len, &count) ||
+              count < 0) {
+            resp_error("ERR value is not an integer or out of range");
+            return;
+          }
+          i++;
+        } else if (strcmp(f, "STREAMS") == 0) {
+          streams_idx = i;
+          break;
+        }
+      } else if (args[i].len == 7) {
+        char f[10];
+        memcpy(f, args[i].data, 7);
+        f[7] = '\0';
+        for (int k = 0; k < 7; k++)
+          f[k] = (char)toupper((unsigned char)f[k]);
+        if (strcmp(f, "STREAMS") == 0) {
+          streams_idx = i;
+          break;
+        }
+      }
+    }
+    if (streams_idx < 0 || streams_idx + 2 >= argc) {
+      resp_error("ERR syntax error");
+      return;
+    }
+    int rem = argc - (streams_idx + 1);
+    if (rem % 2 != 0 || rem < 2) {
+      resp_error("ERR Unbalanced XREAD list of streams");
+      return;
+    }
+    int nstreams = rem / 2;
+
+    int emitted_streams = 0;
+    for (int i = 0; i < nstreams; i++) {
+      Bulk *key = &args[streams_idx + 1 + i];
+      Bulk *lastid = &args[streams_idx + 1 + nstreams + i];
+      expire_if_needed_impl(key->data, key->len);
+      Slot *s = hm_get(&DB, key->data, key->len);
+      if (!s)
+        continue;
+      if (s->type != T_STREAM)
+        continue;
+      long long lm, ls;
+      if (lastid->len == 1 && lastid->data[0] == '$') {
+        lm = LLONG_MAX;
+        ls = LLONG_MAX;
+      } else if (lastid->len == 1 && lastid->data[0] == '0') {
+        lm = 0;
+        ls = 0;
+      } else if (!parse_stream_id(lastid->data, lastid->len, &lm, &ls))
+        continue;
+      int has = 0;
+      for (size_t j = 0; j < s->stream.count; j++) {
+        long long em, es;
+        if (!parse_stream_id(s->stream.entries[j].id,
+                             (int)strlen(s->stream.entries[j].id), &em, &es))
+          continue;
+        if (stream_id_greater(em, es, lm, ls)) {
+          has = 1;
+          break;
+        }
+      }
+      if (has)
+        emitted_streams++;
+    }
+    if (emitted_streams == 0) {
+      resp_null_bulk();
+      return;
+    }
+    resp_array_header(emitted_streams);
+    for (int i = 0; i < nstreams; i++) {
+      Bulk *key = &args[streams_idx + 1 + i];
+      Bulk *lastid = &args[streams_idx + 1 + nstreams + i];
+      expire_if_needed_impl(key->data, key->len);
+      Slot *s = hm_get(&DB, key->data, key->len);
+      if (!s || s->type != T_STREAM)
+        continue;
+
+      long long lm, ls;
+      if (lastid->len == 1 && lastid->data[0] == '$') {
+        lm = LLONG_MAX;
+        ls = LLONG_MAX;
+      } else if (lastid->len == 1 && lastid->data[0] == '0') {
+        lm = 0;
+        ls = 0;
+      } else if (!parse_stream_id(lastid->data, lastid->len, &lm, &ls))
+        continue;
+
+      int total = 0;
+      for (size_t j = 0; j < s->stream.count && (long long)total < count; j++) {
+        long long em, es;
+        if (!parse_stream_id(s->stream.entries[j].id,
+                             (int)strlen(s->stream.entries[j].id), &em, &es))
+          continue;
+        if (stream_id_greater(em, es, lm, ls))
+          total++;
+      }
+      if (total == 0)
+        continue;
+
+      touch_slot(s);
+      resp_array_header(2);
+      resp_bulk(key->data, key->len);
+      resp_array_header(total);
+      int started = 0;
+      for (size_t j = 0; j < s->stream.count && started < total; j++) {
+        long long em, es;
+        if (!parse_stream_id(s->stream.entries[j].id,
+                             (int)strlen(s->stream.entries[j].id), &em, &es))
+          continue;
+        if (!stream_id_greater(em, es, lm, ls))
+          continue;
+
+        resp_array_header(2);
+        resp_bulk(s->stream.entries[j].id,
+                  (int)strlen(s->stream.entries[j].id));
+        resp_array_header(s->stream.entries[j].nfields);
+        for (int k = 0; k < s->stream.entries[j].nfields; k++)
+          resp_bulk(s->stream.entries[j].fields[k],
+                    s->stream.entries[j].flens[k]);
+        started++;
+      }
     }
   }
 }
